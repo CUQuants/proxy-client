@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuq-proxy-client"
+version = "0.1.0"
+description = "SDK for the CU Quants Exchange Access Proxy — signing, idempotency, and typed errors, so a caller never hand-builds a request. v1 is REST-only and scoped to operator (human) credentials; system (bot) credentials and WebSocket support are fast-follows."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "build>=1.0",
+]
+
+[tool.setuptools]
+packages = ["proxy_client"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

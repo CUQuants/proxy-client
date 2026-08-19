@@ -1,0 +1,229 @@
+# cuq-proxy-client
+
+A Python SDK for the CU Quants Exchange Access Proxy. It handles request
+signing, idempotency-key bookkeeping, and typed error classification, so a
+caller gets `client.call(exchange, action, payload)` instead of hand-rolling
+an HMAC-signed HTTP client.
+
+See [`SDK_WRITEUP.md`](../SDK_WRITEUP.md) for the full problem statement.
+Short version: every one of these is a footgun a hand-rolled client has to
+get right on its own, and this package is the one place that gets them right
+once —
+
+- **Signing.** The Proxy verifies an HMAC over the exact raw bytes it
+  received. `requests.post(url, json=payload)` or `httpx`'s `data=` would
+  re-serialize the body and silently break the signature — a bare,
+  uninformative `401`.
+- **Idempotency keys.** Generated once per order intent, reused (not
+  regenerated) on retry — while the timestamp and nonce *do* need to be
+  regenerated on that same retry.
+- **Error classification.** `RATE_LIMITED` means back off and retry with the
+  same key. `IDEMPOTENCY_KEY_REUSED` means stop, that's a bug. `EXCHANGE_ERROR`
+  may or may not be safe to retry depending on a `detail.outcome_unknown`
+  flag. Getting this table wrong either duplicates a live order or gives up
+  on a request that should have been retried.
+
+## v1 scope
+
+- **REST only.** WebSocket support is a fast-follow.
+- **Operator (human) credentials only.** A credential tied to a person
+  (`operator_id`/`operator_name`), not a bot. System credentials
+  (`system_name`, for something like an unattended market-making engine) are
+  a fast-follow — the Proxy enforces strict, opposite rules for the two
+  credential types (an operator credential must *not* send `system_name`; a
+  system credential *must*), and that needs its own design pass rather than
+  a bolted-on kwarg.
+- **No automatic retries.** `call()`/`acall()` raise a typed exception and
+  leave the retry decision to the caller — see [Errors and retries](#errors-and-retries).
+
+## Install
+
+Not yet published to a package index. Build and install the wheel directly:
+
+```bash
+cd proxy-client
+make build
+pip install dist/cuq_proxy_client-0.1.0-py3-none-any.whl
+```
+
+or, for local development against a consumer (editable install so changes
+here show up immediately):
+
+```bash
+pip install -e /path/to/proxy-client
+```
+
+## Quickstart
+
+```python
+from proxy_client import ProxyClient, RateLimitedError, IdempotencyKeyReusedError
+
+client = ProxyClient(
+    base_url="https://your-proxy-host.example",
+    api_key="cuq_op_...",
+    secret="...",           # never store this; read it at process startup only
+    operator_id="cuq-014",
+    operator_name="J. Rivera",
+)
+
+try:
+    result = client.call(
+        exchange="okx",
+        action="get_balance",
+        payload={"ccy": "USDT"},
+    )
+except RateLimitedError as e:
+    ...
+```
+
+`result` is a `ProxyResult` — a `dict` subclass holding exactly the `data`
+field of the Proxy's response envelope, the venue's reply unreshaped, so it
+behaves like a plain dict everywhere you'd use one. It carries one extra
+attribute, `result.idempotent_replay`: `True` when this response wasn't a
+fresh execution but the cached result of an identical earlier request (same
+idempotency key, same body). Most callers can ignore it; it matters if you
+want to distinguish "my retry replayed the original order" from "this placed
+a new one" for logging or alerting. Signing, timestamp, and nonce are
+handled internally on every call.
+
+### Async
+
+```python
+result = await client.acall(exchange="okx", action="get_balance", payload={"ccy": "USDT"})
+```
+
+`call()` and `acall()` are both real transport calls (`httpx.Client` and
+`httpx.AsyncClient` respectively) — `acall()` is not `call()` run in a
+thread, so it's safe to use from a busy event loop without stalling it.
+
+Close the client's connection pools when you're done with it (a client used
+for the lifetime of a process doesn't need to bother):
+
+```python
+client.close()               # or: with ProxyClient(...) as client: ...
+await client.aclose()        # or: async with ProxyClient(...) as client: ...
+```
+
+### Placing an order (idempotency keys)
+
+Any mutating action needs an idempotency key — generated **once per order
+intent**, and reused unchanged across every retry of that same intent:
+
+```python
+from proxy_client import new_idempotency_key, RateLimitedError, IdempotencyInFlightError
+import time
+
+key = new_idempotency_key()  # once, when you decide to place this order
+
+for attempt in range(3):
+    try:
+        result = client.call(
+            exchange="okx",
+            action="place_order",
+            payload={"instId": "BTC-USDT", "tdMode": "cash", "side": "buy",
+                     "ordType": "market", "sz": "10"},
+            idempotency_key=key,  # same key every attempt
+        )
+        break
+    except (RateLimitedError, IdempotencyInFlightError) as e:
+        time.sleep(getattr(e, "retry_after", None) or 1.0)
+```
+
+Generating a new key on retry defeats the protection: the whole point is
+that resending the *same* key after a dropped connection cannot place a
+second order.
+
+### Normalized orders (OKX only, for now)
+
+`call()`'s `payload` is forwarded to the exchange byte-for-byte — you're
+writing that venue's own field names (`px`, `sz`, `instId`, ...). For OKX,
+`proxy_client.orders` gives you a venue-agnostic alternative:
+
+```python
+from proxy_client import okx_place_order, okx_cancel_order, new_idempotency_key
+
+result = okx_place_order(
+    client,
+    {"symbol": "BTC-USDT", "side": "buy", "order_type": "limit",
+     "price": "50000", "size": "0.01"},
+    idempotency_key=new_idempotency_key(),
+)
+
+okx_cancel_order(client, order_id=result["ordId"], symbol="BTC-USDT")
+```
+
+Async equivalents are `okx_aplace_order` / `okx_acancel_order`, both real
+`await`s on `client.acall()` — the normalization itself is pure and needs no
+async form. Other exchanges and order actions (`amend_order`, batch orders)
+aren't covered yet; see `orders.py`'s module docstring before adding one.
+
+## Errors and retries
+
+Every exception is a `ProxyError` subclass, importable from `proxy_client`.
+Each carries `.code`, `.message`, `.detail`, `.request_id`, and a class-level
+`.retryable` (`True`, `False`, or `None` — "depends, inspect the exception").
+
+| Exception                     | Code                     | Retryable (same key)                          |
+|--------------------------------|---------------------------|------------------------------------------------|
+| `AuthFailedError`              | `AUTH_FAILED`             | No — bad secret, unknown key, or clock skew    |
+| `CredentialExpiredError`       | `CREDENTIAL_EXPIRED`      | No                                              |
+| `ActionNotPermittedError`      | `ACTION_NOT_PERMITTED`    | No                                              |
+| `MalformedRequestError`        | `MALFORMED_REQUEST`       | No — an SDK bug if you see this                |
+| `IdempotencyKeyRequiredError`  | `IDEMPOTENCY_KEY_REQUIRED`| No — a caller bug (forgot the key)             |
+| `IdempotencyKeyReusedError`    | `IDEMPOTENCY_KEY_REUSED`  | **Never** — same key, different body: a real bug|
+| `IdempotencyInFlightError`     | `IDEMPOTENCY_IN_FLIGHT`   | Yes, after a short backoff                     |
+| `LogUnavailableError`          | `LOG_UNAVAILABLE`         | Yes — nothing was forwarded yet                |
+| `RateLimitedError`             | `RATE_LIMITED`            | Yes, after `.retry_after` seconds              |
+| `ExchangeError`                | `EXCHANGE_ERROR`          | Depends — see `.outcome_unknown` below         |
+| `ProxyUnreachableError`        | *(transport failure)*     | Depends — same as `outcome_unknown`            |
+
+`ExchangeError.outcome_unknown` is the one case this table can't answer
+statically:
+
+```python
+except ExchangeError as e:
+    if e.outcome_unknown:
+        # Forwarded to the exchange, but the outcome was never learned
+        # (timeout, connection drop mid-flight). The Proxy leaves the
+        # idempotency claim in-flight rather than release it, specifically
+        # so a naive retry can't duplicate the order — a retry with the
+        # same key gets IdempotencyInFlightError, not a second placement.
+        # This is a "get a human to look" case, not a tight retry loop.
+        alert_a_human(e)
+    else:
+        # The exchange answered definitively (e.g. rejected the order).
+        # Retrying with the same key just replays that same answer.
+        raise
+```
+
+An unrecognised code (e.g. a new one the server starts sending before this
+SDK knows about it) falls back to the base `ProxyError` with
+`retryable = False` — fails closed rather than guessing.
+
+## Development
+
+```bash
+make install   # create .venv, install with dev dependencies
+make test      # run the test suite
+make build     # build the sdist and wheel into dist/
+make clean     # remove .venv, build artifacts, and caches
+```
+
+`tests/test_signing.py` pins golden values computed directly against
+`trading-gateway/proxy/signing.py`, and `tests/test_error_parity.py` pins a
+snapshot of `trading-gateway/proxy/errors.py`'s code table — both are meant
+to catch the server's protocol drifting out from under this SDK. Both are
+plain pinned constants, not a live import: this package's test suite doesn't
+depend on `trading-gateway` being checked out anywhere. If the server's
+signing logic or error codes change, update the pinned values by hand — see
+each file's module docstring for exactly what to re-run.
+
+## Roadmap
+
+- System (bot) credentials, for unattended consumers like `speedbyte`.
+- WebSocket support (handshake, `op`/`method` frame handling, reconnect).
+
+Both are deliberately out of v1: this package ships the proven,
+human-facing half first (mirroring `xlrts/src/proxy_session.py`, the
+reference implementation this SDK generalizes), rather than block on the
+harder halves.
