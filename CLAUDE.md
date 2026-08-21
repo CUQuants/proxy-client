@@ -82,11 +82,11 @@ extra attribute, `.idempotent_replay`, sourced from the real
 These were each considered and explicitly deferred; if a task seems to call
 for one, that's worth flagging rather than just implementing:
 
-- **System (bot) credentials.** `envelope.py`/`client.py` only support
-  operator (human) credentials — no `system_name` field. The Proxy enforces
-  strict, opposite rules for the two credential types (`trading-gateway/proxy/auth.py`),
-  which needs its own design pass, not a bolted-on kwarg.
-- **WebSocket support.** REST only.
+- **WebSocket support.** REST only. `ProxyClient.for_operator`/`for_system`
+  cover both credential types now (see `client.py`'s and `envelope.py`'s
+  docstrings), but WS is its own future class, not something to grow onto
+  `ProxyClient` — REST and WS share no runtime behavior beyond the HMAC
+  signing primitive in `signing.py`.
 - **Automatic retries.** `call()`/`acall()` always raise; retry policy is
   the caller's decision. See `README.md`'s error/retry table for why.
 - **Client-side action/exchange allowlist validation.** The Proxy's

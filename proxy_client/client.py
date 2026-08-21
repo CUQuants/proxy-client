@@ -4,9 +4,10 @@
 v1 scope (see SDK_WRITEUP.md and the follow-up decision to ship this first):
 
 - REST only. WebSocket is a fast-follow.
-- Operator (human) credentials only. `system_name` / bot credentials are a
-  fast-follow — see `envelope.py`'s docstring for why that isn't just a
-  missing kwarg.
+- Both operator (human) and system (bot) credentials are supported —
+  `ProxyClient.for_operator(...)` / `ProxyClient.for_system(...)`. See
+  `envelope.py`'s docstring for how the two stay mutually exclusive on the
+  wire without either constructor trusting the caller to get it right.
 - No automatic retries. `call()`/`acall()` raise a typed `ProxyError`
   subclass (see `errors.py`) and leave the retry decision to the caller,
   matching the pattern in SDK_WRITEUP.md's own example:
@@ -70,7 +71,7 @@ class ProxyResult(dict):
 
 
 class ProxyClient:
-    """One trader's authenticated session against the Proxy.
+    """One caller's authenticated session against the Proxy.
 
     Holds `secret` in memory only, for the life of this object. Never log
     or serialize a `ProxyClient` instance — `__repr__` is overridden so an
@@ -82,6 +83,16 @@ class ProxyClient:
     (or use as a context manager) to release their connection pools when
     done; a `ProxyClient` used for the lifetime of a process doesn't need to
     bother.
+
+    Construct via `ProxyClient.for_operator(...)` or `.for_system(...)`
+    (equivalent to calling `ProxyClient(...)` directly for the operator
+    case) rather than passing `system_name` as a loose kwarg here — there
+    isn't one. That's deliberate: an operator credential must never carry
+    `system_name` on the wire and a system credential always must
+    (`trading-gateway/proxy/auth.py`), and the server's rejection for
+    getting it wrong is the same uninformative `AUTH_FAILED` for either
+    mistake. Making `__init__` operator-only means there's no path to
+    building an operator-looking client that accidentally carries one.
     """
 
     def __init__(
@@ -99,11 +110,61 @@ class ProxyClient:
         self._secret = secret.encode("utf-8")
         self.operator_id = operator_id
         self.operator_name = operator_name
+        self._system_name: str | None = None
         self._client = httpx.Client(timeout=timeout)
         self._aclient = httpx.AsyncClient(timeout=timeout)
 
+    @classmethod
+    def for_operator(
+        cls,
+        base_url: str,
+        api_key: str,
+        secret: str,
+        operator_id: str,
+        operator_name: str,
+        *,
+        timeout: float = 15.0,
+    ) -> "ProxyClient":
+        """Identical to `ProxyClient(...)` — exists so a call site reads
+        symmetrically next to `for_system()`."""
+        return cls(base_url, api_key, secret, operator_id, operator_name, timeout=timeout)
+
+    @classmethod
+    def for_system(
+        cls,
+        base_url: str,
+        api_key: str,
+        secret: str,
+        operator_id: str,
+        operator_name: str,
+        system_name: str,
+        *,
+        timeout: float = 15.0,
+    ) -> "ProxyClient":
+        """Build a client authenticating as a system (bot) credential,
+        still attributed to the given responsible operator — both are
+        required on every request regardless of credential type
+        (`trading-gateway/proxy/auth.py`'s `_attribute`).
+
+        `system_name` has no other entry point onto a `ProxyClient`: this
+        is the only constructor that sets it, so there is no way to end up
+        with an operator-built client that carries one by accident.
+        """
+        if not system_name:
+            raise ValueError("system_name is required for a system credential")
+        client = cls(base_url, api_key, secret, operator_id, operator_name, timeout=timeout)
+        client._system_name = system_name
+        return client
+
+    @property
+    def system_name(self) -> str | None:
+        """`None` for an operator client; the bot's registered name for a
+        system client (set only via `for_system()`)."""
+        return self._system_name
+
     def __repr__(self) -> str:
-        return f"<ProxyClient {self.operator_id!r} via {self._base!r}>"
+        who = self._system_name or self.operator_id
+        return f"<ProxyClient {who!r} via {self._base!r}>"
 
     def close(self) -> None:
         self._client.close()
@@ -134,6 +195,7 @@ class ProxyClient:
             action=action,
             operator_id=self.operator_id,
             operator_name=self.operator_name,
+            system_name=self._system_name,
             payload=payload,
         )
 

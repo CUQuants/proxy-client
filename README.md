@@ -26,13 +26,13 @@ once —
 ## v1 scope
 
 - **REST only.** WebSocket support is a fast-follow.
-- **Operator (human) credentials only.** A credential tied to a person
-  (`operator_id`/`operator_name`), not a bot. System credentials
-  (`system_name`, for something like an unattended market-making engine) are
-  a fast-follow — the Proxy enforces strict, opposite rules for the two
-  credential types (an operator credential must *not* send `system_name`; a
-  system credential *must*), and that needs its own design pass rather than
-  a bolted-on kwarg.
+- **Both operator and system credentials.** `ProxyClient.for_operator(...)`
+  for a credential tied to a person, `ProxyClient.for_system(...)` for a
+  bot/unattended consumer (like `speedbyte`) carrying `system_name`. The two
+  constructors exist because the Proxy enforces strict, opposite rules for
+  the two credential types (an operator credential must *not* send
+  `system_name`; a system credential *must*) — see
+  [System (bot) credentials](#system-bot-credentials).
 - **No automatic retries.** `call()`/`acall()` raise a typed exception and
   leave the retry decision to the caller — see [Errors and retries](#errors-and-retries).
 
@@ -58,13 +58,15 @@ pip install -e /path/to/proxy-client
 ```python
 from proxy_client import ProxyClient, RateLimitedError, IdempotencyKeyReusedError
 
-client = ProxyClient(
+client = ProxyClient.for_operator(
     base_url="https://your-proxy-host.example",
     api_key="cuq_op_...",
     secret="...",           # never store this; read it at process startup only
     operator_id="cuq-014",
     operator_name="J. Rivera",
 )
+# ProxyClient(...) directly is identical — for_operator() just reads
+# symmetrically next to for_system(), below.
 
 try:
     result = client.call(
@@ -132,6 +134,34 @@ for attempt in range(3):
 Generating a new key on retry defeats the protection: the whole point is
 that resending the *same* key after a dropped connection cannot place a
 second order.
+
+### System (bot) credentials
+
+An unattended consumer (a bot, a market-making engine) authenticates with a
+system credential rather than a person's — `ProxyClient.for_system(...)`
+instead of `.for_operator(...)`:
+
+```python
+client = ProxyClient.for_system(
+    base_url="https://your-proxy-host.example",
+    api_key="cuq_sys_...",
+    secret="...",
+    operator_id="cuq-014",           # still required: the human responsible for this run
+    operator_name="J. Rivera",
+    system_name="speedbyte",
+)
+```
+
+`operator_id`/`operator_name` are required either way — the Proxy always
+wants a responsible human on record, bot or not — but a system credential
+isn't tied to *that* operator specifically the way an operator credential is
+to its own owner. `call()`/`acall()` work identically after construction;
+the only difference is what's in the signed envelope. There's no
+`system_name` kwarg on `ProxyClient(...)` itself or on `.for_operator(...)`,
+so there's no way to end up with an operator-looking client that
+accidentally carries one, or a system client that's missing it — both are
+the same uninformative `AUTH_FAILED` from the server if you get them
+backwards.
 
 ### Normalized orders (OKX only, for now)
 
@@ -220,10 +250,12 @@ each file's module docstring for exactly what to re-run.
 
 ## Roadmap
 
-- System (bot) credentials, for unattended consumers like `speedbyte`.
-- WebSocket support (handshake, `op`/`method` frame handling, reconnect).
+- WebSocket support (handshake, `op`/`method` frame handling, reconnect), as
+  its own class rather than grown onto `ProxyClient` — REST and WS share no
+  runtime behavior beyond the HMAC signing primitive (`signing.py`), so
+  there's no transport-level reason to couple them.
 
-Both are deliberately out of v1: this package ships the proven,
-human-facing half first (mirroring `xlrts/src/proxy_session.py`, the
-reference implementation this SDK generalizes), rather than block on the
-harder halves.
+Deliberately out of v1: this package shipped the REST surface first
+(`xlrts/src/proxy_session.py` was the original hand-rolled implementation
+this SDK generalizes, and now delegates to it), leaving WebSocket for later
+rather than blocking on the harder half.

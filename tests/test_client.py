@@ -139,6 +139,74 @@ def test_acall_signs_the_exact_bytes_it_sends():
     assert headers["X-Idempotency-Key"] == "k1"
 
 
+# -- system (bot) credentials -------------------------------------------------
+
+
+def _system_client() -> ProxyClient:
+    return ProxyClient.for_system(
+        base_url="https://proxy.example.com",
+        api_key="cuq_sys_test",
+        secret="s3cr3t",
+        operator_id="cuq-001",
+        operator_name="Automated - speedbyte",
+        system_name="speedbyte",
+    )
+
+
+def test_for_system_call_includes_system_name_in_signed_body():
+    client = _system_client()
+    ok = _fake_response(200, {"data": {}})
+
+    with patch.object(client._client, "post", return_value=ok) as post:
+        client.call("kraken", "get_balance", {})
+
+    _, kwargs = post.call_args
+    sent_body = kwargs["content"]
+    headers = kwargs["headers"]
+
+    expected_sig = compute_signature(
+        b"s3cr3t", "POST", "/v1/kraken", headers["X-Timestamp"], headers["X-Nonce"], sent_body
+    )
+    assert headers["X-Signature"] == expected_sig
+    parsed = json.loads(sent_body)
+    assert parsed["system_name"] == "speedbyte"
+    assert parsed["operator_id"] == "cuq-001"
+
+
+def test_for_system_requires_system_name():
+    with pytest.raises(ValueError):
+        ProxyClient.for_system(
+            base_url="https://proxy.example.com",
+            api_key="cuq_sys_test",
+            secret="s3cr3t",
+            operator_id="cuq-001",
+            operator_name="Automated - speedbyte",
+            system_name="",
+        )
+
+
+def test_for_operator_is_equivalent_to_init():
+    via_init = _client()
+    via_classmethod = ProxyClient.for_operator(
+        base_url="https://proxy.example.com",
+        api_key="cuq_op_test",
+        secret="s3cr3t",
+        operator_id="cuq-014",
+        operator_name="J. Rivera",
+    )
+    ok = _fake_response(200, {"data": {}})
+
+    bodies = []
+    for client in (via_init, via_classmethod):
+        with patch.object(client._client, "post", return_value=ok) as post:
+            client.call("okx", "get_balance", {"ccy": "USDT"})
+        bodies.append(post.call_args.kwargs["content"])
+
+    assert bodies[0] == bodies[1]
+    assert "system_name" not in json.loads(bodies[1])
+    assert via_classmethod.system_name is None
+
+
 def test_acall_transport_failure_raises_proxy_unreachable():
     client = _client()
     with patch.object(
