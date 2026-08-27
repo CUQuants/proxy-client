@@ -51,3 +51,9 @@ __all__ = [
     "okx_cancel_order",
     "okx_acancel_order",
 ]
+
+# WebSocket support requires the optional `websocket` extra
+# (`pip install cuq-proxy-client[websocket]`) since it's the only part of
+# this package that needs the `websockets` library. Imported lazily via
+# `proxy_client.websocket` rather than re-exported here, so a REST-only
+# install never has to resolve that import at all.
