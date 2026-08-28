@@ -321,7 +321,7 @@ def test_heartbeat_timeout_forces_close_and_reconnect_fires():
         async with _fake_proxy(handler) as base_url:
             client = _client(
                 base_url,
-                reconnect=lambda attempt, dur, err: 0.01,
+                reconnect=lambda attempt: 0.01,
                 heartbeat_interval=0.05,
                 heartbeat_timeout=0.1,
             )
@@ -357,7 +357,7 @@ def test_default_backoff_reconnects_and_replays_subscriptions():
 
     async def run():
         async with _fake_proxy(handler) as base_url:
-            client = _client(base_url, reconnect=lambda attempt, dur, err: 0.01)
+            client = _client(base_url, reconnect=lambda attempt: 0.01)
             await client.start()
             # Persisted, so it's replayed once connection 2 comes up.
             await client.subscribe("ticker", {"symbol": ["BTC/USD"]}, persist=True)
@@ -392,7 +392,7 @@ def test_reconnect_policy_receives_attempt_and_can_give_up():
         await _accept_auth(ws)
         await ws.close()
 
-    def backoff(attempt, connected_duration, last_error):
+    def backoff(attempt):
         calls.append(attempt)
         return None if attempt >= 2 else 0.01
 
@@ -437,3 +437,63 @@ def test_on_error_fires_for_a_raising_handler_and_loop_survives():
     assert len(delivered) == 2  # the second message still got through
     assert len(errors) == 1
     assert isinstance(errors[0], ValueError)
+
+
+# -- request correlation internals -------------------------------------
+
+
+def test_pending_requests_routing_and_fail_all():
+    from proxy_client.websocket._rpc import _PendingRequests
+
+    async def run():
+        p = _PendingRequests()
+
+        # req_id routing
+        assert p.next_id() == 1
+        f1 = p.create(1)
+        assert p.resolve({"req_id": 1, "ok": True}) is True
+        assert f1.result() == {"req_id": 1, "ok": True}
+
+        # order frames correlate on `id` even with no req_id present
+        f2 = p.create(2)
+        assert p.resolve({"event": "result", "id": 2}) is True
+        assert f2.result()["id"] == 2
+
+        # the pong occupies a reserved slot, not a numeric id
+        fp = p.expect_pong()
+        assert p.resolve({"event": "pong"}) is True and fp.done()
+        p.discard_pong()
+
+        # a server-initiated push is not consumed - it goes to handlers
+        assert p.resolve({"channel": "book", "data": []}) is False
+
+        # an id-less Proxy error is swallowed here, never handed to handlers
+        assert p.resolve({"event": "error", "data": {"error": {"code": "X"}}}) is True
+
+        # fail_all propagates to every waiter and empties the map
+        f3 = p.create(3)
+        p.fail_all(ConnectionError("drop"))
+        with pytest.raises(ConnectionError):
+            f3.result()
+        assert p.resolve({"req_id": 3}) is False
+
+    asyncio.run(run())
+
+
+def test_in_flight_request_fails_fast_when_connection_drops():
+    """A request awaiting a reply when the socket dies raises immediately
+    (chained ConnectionError), rather than blocking until its timeout."""
+    async def handler(ws):
+        await _accept_auth(ws)
+        await ws.recv()   # take the request frame ...
+        await ws.close()  # ... then drop instead of answering it
+
+    async def run():
+        async with _fake_proxy(handler) as base_url:
+            client = _client(base_url, reconnect=None)
+            await client.start()
+            with pytest.raises(ConnectionError):
+                await client.request("cancel_all", timeout=30)
+            await client.stop()
+
+    asyncio.run(run())

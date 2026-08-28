@@ -22,7 +22,7 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["proxy_client"]
+packages = ["proxy_client", "proxy_client.websocket"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
