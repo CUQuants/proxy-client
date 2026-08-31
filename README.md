@@ -23,18 +23,26 @@ once —
   flag. Getting this table wrong either duplicates a live order or gives up
   on a request that should have been retried.
 
-## v1 scope
+## Scope
 
-- **REST only.** WebSocket support is a fast-follow.
-- **Both operator and system credentials.** `ProxyClient.for_operator(...)`
-  for a credential tied to a person, `ProxyClient.for_system(...)` for a
-  bot/unattended consumer (like `speedbyte`) carrying `system_name`. The two
-  constructors exist because the Proxy enforces strict, opposite rules for
-  the two credential types (an operator credential must *not* send
-  `system_name`; a system credential *must*) — see
+- **REST and WebSocket (Kraken).** `ProxyClient` for `/v1/{exchange}` REST
+  calls, `ProxyWebSocketClient` for the `/v1/{exchange}/ws` route — see
+  [WebSocket](#websocket) below. WS is Kraken-only for now; OKX rides a
+  different Proxy dialect that no consumer currently reaches through this
+  SDK.
+- **Both operator and system credentials**, on both transports.
+  `.for_operator(...)` for a credential tied to a person, `.for_system(...)`
+  for a bot/unattended consumer (like `speedbyte`) carrying `system_name`.
+  The two constructors exist because the Proxy enforces strict, opposite
+  rules for the two credential types (an operator credential must *not*
+  send `system_name`; a system credential *must*) — see
   [System (bot) credentials](#system-bot-credentials).
-- **No automatic retries.** `call()`/`acall()` raise a typed exception and
-  leave the retry decision to the caller — see [Errors and retries](#errors-and-retries).
+- **No automatic retries on REST.** `call()`/`acall()` raise a typed
+  exception and leave the retry decision to the caller — see
+  [Errors and retries](#errors-and-retries). WebSocket reconnection is
+  different: a dropped connection isn't a business decision the way
+  resending a mutating request is, so `ProxyWebSocketClient` *does* own
+  reconnection — its aggressiveness is a parameter, not a caller-built loop.
 
 ## Install
 
@@ -43,7 +51,9 @@ Not yet published to a package index. Build and install the wheel directly:
 ```bash
 cd proxy-client
 make build
-pip install dist/cuq_proxy_client-0.1.0-py3-none-any.whl
+pip install dist/cuq_proxy_client-0.2.0-py3-none-any.whl
+# add [websocket] if you need ProxyWebSocketClient:
+pip install "dist/cuq_proxy_client-0.2.0-py3-none-any.whl[websocket]"
 ```
 
 or, for local development against a consumer (editable install so changes
@@ -187,6 +197,116 @@ Async equivalents are `okx_aplace_order` / `okx_acancel_order`, both real
 async form. Other exchanges and order actions (`amend_order`, batch orders)
 aren't covered yet; see `orders.py`'s module docstring before adding one.
 
+## WebSocket
+
+`ProxyWebSocketClient` reaches trading-gateway's `/v1/{exchange}/ws` route
+(Kraken only for now). Requires the `websocket` extra, since it's the only
+part of this package that needs the `websockets` library:
+
+```bash
+pip install "cuq-proxy-client[websocket]"
+```
+
+```python
+from proxy_client.websocket import ProxyWebSocketClient
+
+client = ProxyWebSocketClient.for_operator(
+    base_url="https://your-proxy-host.example",
+    api_key="cuq_op_...",
+    secret="...",
+    operator_id="cuq-014",
+    operator_name="J. Rivera",
+)
+
+async def on_book(msg: dict) -> None:
+    for level in msg.get("data", []):
+        ...
+
+client.add_handler("book", on_book)   # or subclass and override on_message()
+
+await client.start()
+await client.subscribe("book", {"symbol": ["BTC/USD"], "depth": 10})
+await client.run_forever()            # blocks until stop() or the connection gives up for good
+```
+
+Kraken's own `method`/`params`/`req_id` vocabulary travels verbatim — you're
+writing the same subscribe/order payloads you would against Kraken WS v2
+directly. Two things are handled for you: the signed handshake (identical
+mechanism to REST's `compute_signature`, just over `WS`), and everything
+below.
+
+### Reconnect and heartbeat are parameters, not something you build
+
+A dropped connection isn't a business decision — nobody wants a market-data
+stream to just go quiet, the way `ProxyClient.call()`'s "no auto-retry"
+stance correctly leaves a *mutating* retry to you. So `ProxyWebSocketClient`
+owns the reconnect loop and the heartbeat loop; you control their timing:
+
+```python
+client = ProxyWebSocketClient.for_operator(
+    ..., 
+    reconnect=None,              # disable: a dropped connection just ends
+    heartbeat_interval=None,     # disable: no application-level ping loop
+)
+```
+
+`reconnect` defaults to `default_backoff()` — exponential, capped at 30s,
+forgiving of a connection that was healthy for a while before dropping
+(mirrors `trading-gateway`'s own upstream reconnect policy). Swap in your
+own:
+
+```python
+def my_backoff(attempt: int, connected_duration: float, last_error: Exception | None) -> float | None:
+    if attempt > 10:
+        return None          # stop reconnecting for good
+    return min(1.0 * attempt, 15.0)
+
+client = ProxyWebSocketClient.for_operator(..., reconnect=my_backoff)
+```
+
+Active subscriptions are replayed automatically after every reconnect.
+`heartbeat_interval`/`heartbeat_timeout` (default 30s/10s) are plain numbers
+— pure keep-alive wire mechanics, nothing to swap in besides the timing.
+
+### Handlers are the app-level seam
+
+Routing an inbound frame to whichever handler is registered for its channel
+is the SDK's job (`add_handler(channel, callback)`, or subclass and
+override `on_message()`); what the callback does with that message is
+yours. If a handler raises, the read loop doesn't die — the exception goes
+to `on_error` instead:
+
+```python
+def log_bad_handler(exc: Exception) -> None:
+    logging.exception("WS handler failed", exc_info=exc)
+
+client = ProxyWebSocketClient.for_operator(..., on_error=log_bad_handler)
+```
+
+Default (`on_error=None`) is log-and-continue.
+
+### Orders over WebSocket
+
+Kraken executes orders on the same socket (its WS and REST order
+vocabularies differ — `order_qty`/`symbol` vs `volume`/`pair` — so an order
+placed over WS isn't relayed through REST). `request()` handles req_id/`id`
+correlation and idempotency-key injection for you:
+
+```python
+response = await client.request(
+    "add_order",
+    params={"symbol": "BTC/USD", "side": "buy", "order_type": "market", "order_qty": "0.01"},
+    # idempotency_key="...": omit it and one is generated for you; if you
+    # pass one, reuse it unchanged across retries of this same order.
+)
+```
+
+Raises a typed `ProxyError` subclass (same hierarchy as REST, via
+`errors.from_response`) if the Proxy refused the frame, or
+`WebSocketRequestError` if Kraken itself rejected it (`success: false`) —
+kept as a separate exception type since that's Kraken's own vocabulary, not
+one of the Proxy's §9 codes.
+
 ## Errors and retries
 
 Every exception is a `ProxyError` subclass, importable from `proxy_client`.
@@ -239,6 +359,11 @@ make build     # build the sdist and wheel into dist/
 make clean     # remove .venv, build artifacts, and caches
 ```
 
+`tests/test_websocket.py` covers `ProxyWebSocketClient` against a small
+in-process fake Proxy server (`websockets.serve`), not a real
+`trading-gateway` checkout — same filesystem-independence rule as the rest
+of this suite.
+
 `tests/test_signing.py` pins golden values computed directly against
 `trading-gateway/proxy/signing.py`, and `tests/test_error_parity.py` pins a
 snapshot of `trading-gateway/proxy/errors.py`'s code table — both are meant
@@ -250,12 +375,15 @@ each file's module docstring for exactly what to re-run.
 
 ## Roadmap
 
-- WebSocket support (handshake, `op`/`method` frame handling, reconnect), as
-  its own class rather than grown onto `ProxyClient` — REST and WS share no
-  runtime behavior beyond the HMAC signing primitive (`signing.py`), so
-  there's no transport-level reason to couple them.
+- `xlrts` and `speedbyte` each still hand-roll their own `ws_url()` /
+  `ws_auth_frame()` in a local `ProxySession`-style class rather than using
+  `ProxyWebSocketClient` — migrating them is separate follow-up work, not
+  done as part of adding this class.
+- OKX over WebSocket: no consumer currently reaches OKX through the Proxy's
+  WS route, so `ProxyWebSocketClient` stays Kraken-only until one does.
 
-Deliberately out of v1: this package shipped the REST surface first
+This package shipped the REST surface first
 (`xlrts/src/proxy_session.py` was the original hand-rolled implementation
-this SDK generalizes, and now delegates to it), leaving WebSocket for later
-rather than blocking on the harder half.
+this SDK generalizes, and now delegates to it) — WebSocket followed once a
+second consumer (`speedbyte`) had independently hand-rolled the same
+handshake, making the duplication worth extracting.

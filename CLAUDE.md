@@ -57,6 +57,19 @@ Request flow through the modules, for one `client.call(exchange, action, payload
 5. **`idempotency.py`** is just `new_idempotency_key()` — a UUID4 generator.
    The lifecycle rule (generate once per intent, reuse unchanged across
    retries) is documented there but enforced by the caller, not this SDK.
+6. **`websocket.py`** (`ProxyWebSocketClient`) is the WS counterpart,
+   reaching `/v1/{exchange}/ws` (Kraken only). Separate class, not grown
+   onto `ProxyClient` — REST and WS share no runtime behavior beyond
+   `signing.compute_signature`. Requires the `websocket` extra
+   (`pip install cuq-proxy-client[websocket]`); only this module imports
+   `websockets`, so a REST-only install never resolves that dependency.
+   Unlike REST's "no auto-retry" stance, this class *does* own reconnect
+   and heartbeat — a dropped connection isn't a business decision the way
+   resending a mutating request is — but exposes their timing as plain
+   parameters/callables (`reconnect`, `heartbeat_interval`,
+   `heartbeat_timeout`) rather than hardcoding them. See its module
+   docstring for the full mechanics-vs-policy reasoning, and `README.md`'s
+   WebSocket section for usage.
 
 **The one invariant everything else depends on:** the bytes that get signed
 must be the *exact* bytes that get sent — never re-serialized in between.
@@ -82,11 +95,17 @@ extra attribute, `.idempotent_replay`, sourced from the real
 These were each considered and explicitly deferred; if a task seems to call
 for one, that's worth flagging rather than just implementing:
 
-- **WebSocket support.** REST only. `ProxyClient.for_operator`/`for_system`
-  cover both credential types now (see `client.py`'s and `envelope.py`'s
-  docstrings), but WS is its own future class, not something to grow onto
-  `ProxyClient` — REST and WS share no runtime behavior beyond the HMAC
-  signing primitive in `signing.py`.
+- **WebSocket support beyond Kraken.** `ProxyWebSocketClient`
+  (`websocket.py`) covers Kraken; OKX over WS is still out of scope — no
+  consumer currently reaches OKX through the Proxy's WS route, so there's
+  no venue-dialect abstraction here (unlike `trading-gateway`'s own
+  `proxy/ws/dialect.py`, which has two venues to abstract over). Don't add
+  one speculatively; wait for a second venue that actually needs it.
+- **Migrating `xlrts`/`speedbyte`/the trading terminal onto
+  `ProxyWebSocketClient`.** Both `xlrts` and `speedbyte` still hand-roll
+  their own `ws_url()`/`ws_auth_frame()` in a local `ProxySession`-style
+  class as of `websocket.py` landing — that migration is separate
+  follow-up work, not bundled with adding the class.
 - **Automatic retries.** `call()`/`acall()` always raise; retry policy is
   the caller's decision. See `README.md`'s error/retry table for why.
 - **Client-side action/exchange allowlist validation.** The Proxy's
