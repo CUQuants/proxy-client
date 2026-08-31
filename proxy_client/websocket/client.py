@@ -18,10 +18,10 @@ from typing import Any, Callable
 
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
-from ..errors import from_response
 from ..idempotency import new_idempotency_key
 from ._backoff import ReconnectBackoff, default_backoff
 from ._connection import _build_auth_frame, _build_ws_url, _Connection
+from ._dialect import Dialect, WebSocketRequestError, dialect_for_exchange
 from ._rpc import _PendingRequests
 
 __all__ = ["ProxyWebSocketClient", "WebSocketRequestError"]
@@ -59,20 +59,6 @@ def _as_connection_error(exc: BaseException | None) -> ConnectionError:
     )
     err.__cause__ = exc
     return err
-
-
-class WebSocketRequestError(RuntimeError):
-    """A Kraken-native WS rejection (`{"success": false, "error": ...}`).
-
-    Deliberately not a `ProxyError` subclass: that hierarchy mirrors the
-    Proxy's own §9 error-code table (see `errors.py`), and a venue-level
-    subscribe/method rejection isn't one of those codes — it's Kraken's
-    own vocabulary, relayed verbatim per §4.3's pass-through principle.
-    """
-
-    def __init__(self, message: str, *, response: dict[str, Any] | None = None) -> None:
-        super().__init__(message)
-        self.response = response
 
 
 class ProxyWebSocketClient:
@@ -120,8 +106,12 @@ class ProxyWebSocketClient:
         heartbeat_interval: float | None = 30.0,
         heartbeat_timeout: float = 10.0,
         on_error: Callable[[Exception], None] | None = None,
+        dialect: Dialect | None = None,
     ) -> None:
         self._exchange = exchange
+        # The wire vocabulary for this venue. Defaults from `exchange`;
+        # pass `dialect=` for one the SDK has no built-in for.
+        self._dialect = dialect if dialect is not None else dialect_for_exchange(exchange)
         self._url = _build_ws_url(base_url, ws_url, exchange)
         self._api_key = api_key
         self._secret = secret.encode("utf-8")
@@ -174,6 +164,7 @@ class ProxyWebSocketClient:
         heartbeat_interval: float | None = 30.0,
         heartbeat_timeout: float = 10.0,
         on_error: Callable[[Exception], None] | None = None,
+        dialect: Dialect | None = None,
     ) -> "ProxyWebSocketClient":
         """Identical to `ProxyWebSocketClient(...)` — exists so a call site
         reads symmetrically next to `for_system()`."""
@@ -181,7 +172,7 @@ class ProxyWebSocketClient:
             base_url, api_key, secret, operator_id, operator_name,
             exchange=exchange, ws_url=ws_url, timeout=timeout, reconnect=reconnect,
             heartbeat_interval=heartbeat_interval, heartbeat_timeout=heartbeat_timeout,
-            on_error=on_error,
+            on_error=on_error, dialect=dialect,
         )
 
     @classmethod
@@ -201,6 +192,7 @@ class ProxyWebSocketClient:
         heartbeat_interval: float | None = 30.0,
         heartbeat_timeout: float = 10.0,
         on_error: Callable[[Exception], None] | None = None,
+        dialect: Dialect | None = None,
     ) -> "ProxyWebSocketClient":
         """Build a client authenticating as a system (bot) credential.
 
@@ -214,7 +206,7 @@ class ProxyWebSocketClient:
             base_url, api_key, secret, operator_id, operator_name,
             exchange=exchange, ws_url=ws_url, timeout=timeout, reconnect=reconnect,
             heartbeat_interval=heartbeat_interval, heartbeat_timeout=heartbeat_timeout,
-            on_error=on_error,
+            on_error=on_error, dialect=dialect,
         )
         client._system_name = system_name
         return client
@@ -319,75 +311,47 @@ class ProxyWebSocketClient:
     ) -> dict:
         """Send a method request and await the correlated response.
 
-        Order methods (`ORDER_METHODS`) get an idempotency key
-        auto-generated via `idempotency.new_idempotency_key()` when none
-        is supplied — **a retry must pass the key its first attempt
-        used**; a fresh key per attempt defeats the mechanism.
+        `method` is `"subscribe"` / `"unsubscribe"` or an order method
+        (`ORDER_METHODS`). The active dialect (see `_dialect`) frames it on
+        the wire; the OKX dialect raises `NotImplementedError` for an
+        order method, since OKX order placement over WS isn't wired up yet.
 
-        Raises a typed `ProxyError` subclass (`errors.from_response`) if
-        the Proxy refused the frame itself, `WebSocketRequestError` if
-        Kraken rejected it (`success: false`), `asyncio.TimeoutError` if
-        nothing came back within `timeout`, or `ConnectionError` (with the
-        underlying transport error chained as `__cause__`) if the
-        connection dropped while the request was in flight.
+        Order methods get an idempotency key auto-generated via
+        `idempotency.new_idempotency_key()` when none is supplied — **a
+        retry must pass the key its first attempt used**; a fresh key per
+        attempt defeats the mechanism.
+
+        Raises a typed `ProxyError` subclass if the Proxy refused the
+        frame itself, `WebSocketRequestError` if Kraken rejected it
+        (`success: false`), `asyncio.TimeoutError` if nothing came back
+        within `timeout`, or `ConnectionError` (with the underlying
+        transport error chained as `__cause__`) if the connection dropped
+        while the request was in flight.
         """
+        is_order = method in ORDER_METHODS
+        if is_order:
+            idempotency_key = idempotency_key or new_idempotency_key()
+
         req_id = self._pending.next_id()
-        fut = self._pending.create(req_id)
-
-        msg: dict[str, Any] = {"method": method, "req_id": req_id}
-        if params:
-            msg["params"] = dict(params)
-
-        if method in ORDER_METHODS:
-            # `req_id` is Kraken's, echoed on a subscribe-shaped ack; `id`
-            # is the Proxy's own, because an order's venue-side req_id is
-            # the Proxy's allocation, not the caller's.
-            msg["id"] = req_id
-            msg["idempotency_key"] = idempotency_key or new_idempotency_key()
-        elif idempotency_key:
-            msg["idempotency_key"] = idempotency_key
+        frame, key = self._dialect.request_frame(
+            method, params, req_id, idempotency_key, is_order=is_order
+        )
+        fut = self._pending.create(key)
 
         try:
-            await self.send(msg)
+            await self.send(frame)
             response = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError(
                 f"No response for '{method}' req_id={req_id} within {timeout}s"
             ) from None
         finally:
-            self._pending.discard(req_id)
+            self._pending.discard(key)
 
-        self._raise_for_error_response(method, response)
+        exc = self._dialect.error_of(response)
+        if exc is not None:
+            raise exc
         return response
-
-    @staticmethod
-    def _raise_for_error_response(method: str, response: dict) -> None:
-        """Two failure shapes reach here. The Proxy's own is
-        `event: "error"` (it refused the frame itself, or relays a Proxy
-        §9 code the exchange returned) — raised as a typed `ProxyError`
-        subclass. Kraken's own is `success: false` on a relayed ack — not
-        a Proxy code, so raised as `WebSocketRequestError` instead.
-        """
-        if response.get("event") == "error":
-            data = response.get("data")
-            err = data.get("error") if isinstance(data, dict) else None
-            if isinstance(err, dict):
-                code = err.get("code", "UNKNOWN")
-                message = err.get("message", "the Proxy rejected the request")
-                detail = err.get("detail")
-            else:
-                code = str(response.get("code", "UNKNOWN"))
-                message = response.get("message", "the Proxy rejected the request")
-                detail = data
-            raise from_response(
-                code, message, detail=detail, request_id=response.get("request_id", "")
-            )
-
-        if not response.get("success", True):
-            error = response.get("error", "Unknown error")
-            raise WebSocketRequestError(
-                f"WS '{method}' failed: {error}", response=response
-            )
 
     async def ping(self) -> float:
         """Send an application-level ping and return the round-trip
@@ -627,14 +591,16 @@ class ProxyWebSocketClient:
             self._handle_callback_error(exc, msg)
 
         # Correlated replies (method responses, pongs, id-less Proxy
-        # errors) are consumed here and never reach channel handlers.
-        if self._pending.resolve(msg):
+        # errors) are consumed here and never reach channel handlers. The
+        # dialect knows which field carries the correlation key for this
+        # venue (`req_id`/`id` for Kraken, `id` for OKX).
+        if self._pending.resolve(msg, self._dialect.response_key(msg)):
             return
 
         await self._deliver(msg)
 
     async def _deliver(self, msg: dict) -> None:
-        channel = msg.get("channel")
+        channel = self._dialect.channel_of(msg)
 
         if channel == "heartbeat" and "heartbeat" not in self._handlers:
             return

@@ -2,9 +2,10 @@
 
 `request()` allocates a `req_id`, registers a future, sends the frame, and
 awaits. Every inbound frame is offered to :meth:`_PendingRequests.resolve`
-first; if it carries a correlation id (`id` for order frames, `req_id`
-for everything else) or is a `pong`, it settles the matching future and
-is considered consumed. Anything `resolve` doesn't consume is a
+first, along with the correlation key the active dialect extracted from it
+(see `_dialect.Dialect.response_key`); if that key matches a waiting
+future, or the frame is a `pong`, it settles the matching future and is
+considered consumed. Anything `resolve` doesn't consume is a
 server-initiated push and falls through to the channel handlers.
 """
 
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Hashable
 
 __all__ = ["_PendingRequests"]
 
@@ -63,31 +64,25 @@ class _PendingRequests:
         if fut is None or self._futures.get(_PONG_KEY) is fut:
             self._futures.pop(_PONG_KEY, None)
 
-    def resolve(self, msg: dict) -> bool:
+    def resolve(self, msg: dict, key: Hashable | None) -> bool:
         """Try to route `msg` to a waiting caller.
 
-        Returns ``True`` if `msg` was a correlated reply (or a pong, or a
-        Proxy error with no id that no caller could ever match) and should
-        not be delivered to channel handlers; ``False`` if it's a
-        server-initiated push.
+        `key` is the correlation key the active dialect extracted from
+        `msg` (`None` if the frame carries none). Returns ``True`` if
+        `msg` was a correlated reply (or a pong, or a Proxy error with no
+        id that no caller could ever match) and should not be delivered to
+        channel handlers; ``False`` if it's a server-initiated push.
         """
         if msg.get("event") == "pong":
             return self._settle(_PONG_KEY, msg)
 
-        # Order frames are dual-tagged: `id` is the Proxy's own allocation,
-        # `req_id` is Kraken's echo. Prefer `id`.
-        ident = msg.get("id")
-        if ident is not None and ident in self._futures:
-            return self._settle(ident, msg)
-
-        req_id = msg.get("req_id")
-        if req_id is not None and req_id in self._futures:
-            return self._settle(req_id, msg)
+        if key is not None and key in self._futures:
+            return self._settle(key, msg)
 
         # A Proxy error with no correlation id at all (e.g. a
         # malformed-frame rejection) can't reach a specific caller. Log it
         # and swallow it — it is not a channel push.
-        if msg.get("event") == "error" and ident is None and req_id is None:
+        if msg.get("event") == "error" and key is None:
             logger.error("Proxy error frame with no correlation id: %s", msg)
             return True
 

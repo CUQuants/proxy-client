@@ -25,11 +25,14 @@ once —
 
 ## Scope
 
-- **REST and WebSocket (Kraken).** `ProxyClient` for `/v1/{exchange}` REST
-  calls, `ProxyWebSocketClient` for the `/v1/{exchange}/ws` route — see
-  [WebSocket](#websocket) below. WS is Kraken-only for now; OKX rides a
-  different Proxy dialect that no consumer currently reaches through this
-  SDK.
+- **REST and WebSocket (Kraken + OKX).** `ProxyClient` for `/v1/{exchange}`
+  REST calls, `ProxyWebSocketClient` for the `/v1/{exchange}/ws` route — see
+  [WebSocket](#websocket) below. The two venues speak different WS
+  vocabularies (Kraken: `method`/`params`/`req_id`; OKX: `op`/`args`/`id`),
+  handled by a pluggable `Dialect` chosen from `exchange`. OKX order
+  *placement* over the socket isn't wired up yet — `ProxyClient.call`
+  covers OKX orders — so the OKX dialect raises `NotImplementedError` for
+  an order method.
 - **Both operator and system credentials**, on both transports.
   `.for_operator(...)` for a credential tied to a person, `.for_system(...)`
   for a bot/unattended consumer (like `speedbyte`) carrying `system_name`.
@@ -51,9 +54,9 @@ Not yet published to a package index. Build and install the wheel directly:
 ```bash
 cd proxy-client
 make build
-pip install dist/cuq_proxy_client-0.2.0-py3-none-any.whl
+pip install dist/cuq_proxy_client-0.3.0-py3-none-any.whl
 # add [websocket] if you need ProxyWebSocketClient:
-pip install "dist/cuq_proxy_client-0.2.0-py3-none-any.whl[websocket]"
+pip install "dist/cuq_proxy_client-0.3.0-py3-none-any.whl[websocket]"
 ```
 
 or, for local development against a consumer (editable install so changes
@@ -200,7 +203,7 @@ aren't covered yet; see `orders.py`'s module docstring before adding one.
 ## WebSocket
 
 `ProxyWebSocketClient` reaches trading-gateway's `/v1/{exchange}/ws` route
-(Kraken only for now). Requires the `websocket` extra, since it's the only
+for **Kraken and OKX**. Requires the `websocket` extra, since it's the only
 part of this package that needs the `websockets` library:
 
 ```bash
@@ -229,11 +232,41 @@ await client.subscribe("book", {"symbol": ["BTC/USD"], "depth": 10})
 await client.run_forever()            # blocks until stop() or the connection gives up for good
 ```
 
-Kraken's own `method`/`params`/`req_id` vocabulary travels verbatim — you're
-writing the same subscribe/order payloads you would against Kraken WS v2
-directly. Two things are handled for you: the signed handshake (identical
-mechanism to REST's `compute_signature`, just over `WS`), and everything
-below.
+The venue's own vocabulary travels verbatim — for Kraken you write the same
+`method`/`params`/`req_id` payloads you would against Kraken WS v2, and
+`add_handler("book", ...)` keys off Kraken's top-level `channel`. Two things
+are handled for you: the signed handshake (identical mechanism to REST's
+`compute_signature`, just over `WS`), and everything below.
+
+### OKX
+
+Pass `exchange="okx"`. Everything above is the same; only the wire
+vocabulary differs, and a `Dialect` (`proxy_client.websocket.OKXDialect`,
+selected automatically) handles the translation:
+
+```python
+client = ProxyWebSocketClient.for_operator(
+    base_url="https://your-proxy-host.example",
+    api_key="cuq_op_...", secret="...",
+    operator_id="cuq-014", operator_name="J. Rivera",
+    exchange="okx",
+)
+
+async def on_orders(msg: dict) -> None:
+    for order in msg.get("data", []):
+        ...
+
+client.add_handler("orders", on_orders)   # keyed off OKX's nested arg.channel
+await client.start()
+await client.subscribe("orders", {"instType": "SPOT"})   # -> {"op":"subscribe","args":[{"channel":"orders","instType":"SPOT"}],"id":"..."}
+await client.run_forever()
+```
+
+Spot only, matching the REST adapter. **Placing OKX orders over the socket
+isn't supported yet** — `request("add_order", ...)` raises
+`NotImplementedError` on an OKX client; use `ProxyClient.call(exchange="okx",
+action="place_order", ...)`. Subscribing to the private `orders` / `fills` /
+`account` streams and the public market-data channels is fully supported.
 
 ### Reconnect and heartbeat are parameters, not something you build
 
@@ -285,7 +318,7 @@ client = ProxyWebSocketClient.for_operator(..., on_error=log_bad_handler)
 
 Default (`on_error=None`) is log-and-continue.
 
-### Orders over WebSocket
+### Orders over WebSocket (Kraken only)
 
 Kraken executes orders on the same socket (its WS and REST order
 vocabularies differ — `order_qty`/`symbol` vs `volume`/`pair` — so an order
@@ -359,10 +392,13 @@ make build     # build the sdist and wheel into dist/
 make clean     # remove .venv, build artifacts, and caches
 ```
 
-`tests/test_websocket.py` covers `ProxyWebSocketClient` against a small
-in-process fake Proxy server (`websockets.serve`), not a real
-`trading-gateway` checkout — same filesystem-independence rule as the rest
-of this suite.
+`tests/test_websocket.py` (Kraken) and `tests/test_websocket_okx.py` (OKX)
+cover `ProxyWebSocketClient` against a small in-process fake Proxy server
+(`websockets.serve`), not a real `trading-gateway` checkout — same
+filesystem-independence rule as the rest of this suite.
+`tests/test_ws_dialect.py` unit-tests the `Dialect` implementations
+directly (no socket), with the OKX frame shapes pinned against
+`trading-gateway/proxy/ws/okx.py`.
 
 `tests/test_signing.py` pins golden values computed directly against
 `trading-gateway/proxy/signing.py`, and `tests/test_error_parity.py` pins a
@@ -379,8 +415,11 @@ each file's module docstring for exactly what to re-run.
   `ws_auth_frame()` in a local `ProxySession`-style class rather than using
   `ProxyWebSocketClient` — migrating them is separate follow-up work, not
   done as part of adding this class.
-- OKX over WebSocket: no consumer currently reaches OKX through the Proxy's
-  WS route, so `ProxyWebSocketClient` stays Kraken-only until one does.
+- OKX order *placement* over WebSocket (`op: "order"` / `batch-orders` /
+  `cancel-order`): `OKXDialect.request_frame` raises `NotImplementedError`
+  for it. The trading terminal, which drove OKX WS support, places orders
+  over REST — add this when a consumer actually needs WS order placement,
+  along with `op:"order"` ack correlation.
 
 This package shipped the REST surface first
 (`xlrts/src/proxy_session.py` was the original hand-rolled implementation
