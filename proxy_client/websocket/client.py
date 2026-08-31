@@ -300,10 +300,14 @@ class ProxyWebSocketClient:
     # -- messaging --------------------------------------------------------
 
     async def send(self, message: dict) -> None:
-        if not self.is_connected:
+        # Bind the connection once: a reconnect can swap `self._conn` across
+        # the await below, and the caller is promised `RuntimeError` on a
+        # closed socket, not an `AttributeError` on a `None` that appeared
+        # mid-call.
+        conn = self._conn
+        if conn is None or not conn.is_open:
             raise RuntimeError("WebSocket is not connected. Call start() first.")
-        assert self._conn is not None
-        await self._conn.send(message)
+        await conn.send(message)
 
     async def request(
         self,
@@ -400,7 +404,9 @@ class ProxyWebSocketClient:
             await self.send({"op": "ping"})
             await asyncio.wait_for(fut, timeout=timeout)
         finally:
-            self._pending.discard_pong()
+            # Pass our own future: if `ping()` and the heartbeat overlap, the
+            # loser must not evict the winner's slot on its way out.
+            self._pending.discard_pong(fut)
 
     # -- subscribe / unsubscribe ------------------------------------------
 
@@ -586,6 +592,11 @@ class ProxyWebSocketClient:
                 await asyncio.sleep(interval)
                 if not self._running:
                     return
+                # Bind the connection we're about to ping: on a timeout we
+                # close *that* socket to force a reconnect, and a reconnect
+                # that lands during `_ping_once` must not make us close the
+                # fresh connection instead.
+                conn = self._conn
                 try:
                     await self._ping_once(timeout=self._heartbeat_timeout)
                 except RuntimeError:
@@ -597,8 +608,8 @@ class ProxyWebSocketClient:
                         "Heartbeat timed out after %ds - closing to trigger reconnect",
                         self._heartbeat_timeout,
                     )
-                    if self._conn is not None and self._conn.is_open:
-                        await self._conn.close()
+                    if conn is not None and conn is self._conn and conn.is_open:
+                        await conn.close()
             except asyncio.CancelledError:
                 return
             except Exception:  # noqa: BLE001

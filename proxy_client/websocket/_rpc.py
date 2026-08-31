@@ -56,8 +56,12 @@ class _PendingRequests:
     def expect_pong(self) -> asyncio.Future:
         return self.create(_PONG_KEY)
 
-    def discard_pong(self) -> None:
-        self.discard(_PONG_KEY)
+    def discard_pong(self, fut: asyncio.Future | None = None) -> None:
+        """Drop the in-flight pong slot. Pass the future you registered so a
+        late `finally` can't evict a newer waiter that has since taken the
+        slot (public `ping()` racing the heartbeat's `_ping_once`)."""
+        if fut is None or self._futures.get(_PONG_KEY) is fut:
+            self._futures.pop(_PONG_KEY, None)
 
     def resolve(self, msg: dict) -> bool:
         """Try to route `msg` to a waiting caller.
