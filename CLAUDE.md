@@ -57,19 +57,22 @@ Request flow through the modules, for one `client.call(exchange, action, payload
 5. **`idempotency.py`** is just `new_idempotency_key()` — a UUID4 generator.
    The lifecycle rule (generate once per intent, reuse unchanged across
    retries) is documented there but enforced by the caller, not this SDK.
-6. **`websocket.py`** (`ProxyWebSocketClient`) is the WS counterpart,
-   reaching `/v1/{exchange}/ws` (Kraken only). Separate class, not grown
-   onto `ProxyClient` — REST and WS share no runtime behavior beyond
+6. **`websocket/`** (`ProxyWebSocketClient`) is the WS counterpart,
+   reaching `/v1/{exchange}/ws` for **Kraken and OKX**. Separate class, not
+   grown onto `ProxyClient` — REST and WS share no runtime behavior beyond
    `signing.compute_signature`. Requires the `websocket` extra
-   (`pip install cuq-proxy-client[websocket]`); only this module imports
+   (`pip install cuq-proxy-client[websocket]`); only this package imports
    `websockets`, so a REST-only install never resolves that dependency.
    Unlike REST's "no auto-retry" stance, this class *does* own reconnect
    and heartbeat — a dropped connection isn't a business decision the way
    resending a mutating request is — but exposes their timing as plain
    parameters/callables (`reconnect`, `heartbeat_interval`,
-   `heartbeat_timeout`) rather than hardcoding them. See its module
-   docstring for the full mechanics-vs-policy reasoning, and `README.md`'s
-   WebSocket section for usage.
+   `heartbeat_timeout`) rather than hardcoding them. Per-venue wire
+   vocabulary (Kraken's `method`/`params`/`req_id` vs OKX's `op`/`args`/`id`)
+   lives behind a `Dialect` in `websocket/_dialect.py` — **composition, not
+   subclass hooks**, deliberately mirroring `trading-gateway/proxy/ws/
+   dialect.py`. See the package docstring for the full mechanics-vs-policy
+   reasoning, and `README.md`'s WebSocket section for usage.
 
 **The one invariant everything else depends on:** the bytes that get signed
 must be the *exact* bytes that get sent — never re-serialized in between.
@@ -95,17 +98,18 @@ extra attribute, `.idempotent_replay`, sourced from the real
 These were each considered and explicitly deferred; if a task seems to call
 for one, that's worth flagging rather than just implementing:
 
-- **WebSocket support beyond Kraken.** `ProxyWebSocketClient`
-  (`websocket.py`) covers Kraken; OKX over WS is still out of scope — no
-  consumer currently reaches OKX through the Proxy's WS route, so there's
-  no venue-dialect abstraction here (unlike `trading-gateway`'s own
-  `proxy/ws/dialect.py`, which has two venues to abstract over). Don't add
-  one speculatively; wait for a second venue that actually needs it.
+- **OKX order placement over WebSocket.** `ProxyWebSocketClient` now covers
+  OKX for subscribe/unsubscribe (the trading terminal drove this), via the
+  `Dialect` seam in `websocket/_dialect.py`. But `OKXDialect.request_frame`
+  raises `NotImplementedError` for an order method (`op:"order"` etc.) — no
+  consumer places OKX orders over the socket (REST `call()` covers that),
+  and wiring it up also needs `op:"order"` ack correlation. Add it when a
+  consumer actually needs it, not speculatively.
 - **Migrating `xlrts`/`speedbyte`/the trading terminal onto
-  `ProxyWebSocketClient`.** Both `xlrts` and `speedbyte` still hand-roll
-  their own `ws_url()`/`ws_auth_frame()` in a local `ProxySession`-style
-  class as of `websocket.py` landing — that migration is separate
-  follow-up work, not bundled with adding the class.
+  `ProxyWebSocketClient`.** `xlrts` and `speedbyte` still hand-roll their
+  own `ws_url()`/`ws_auth_frame()` in a local `ProxySession`-style class;
+  the trading terminal's migration (which the OKX dialect exists for) is
+  in progress separately — none of that is bundled with SDK changes here.
 - **Automatic retries.** `call()`/`acall()` always raise; retry policy is
   the caller's decision. See `README.md`'s error/retry table for why.
 - **Client-side action/exchange allowlist validation.** The Proxy's
@@ -116,18 +120,19 @@ for one, that's worth flagging rather than just implementing:
 
 ### Testing philosophy — no filesystem coupling to `trading-gateway`
 
-`tests/test_signing.py` and `tests/test_error_parity.py` guard against this
-SDK silently drifting from the server's actual protocol (canonical signing
-string, error code table). Both do this via **pinned golden constants**
-computed once against `trading-gateway/proxy/signing.py` /
-`proxy/errors.py` and hardcoded in the test file — not a live import of
+`tests/test_signing.py`, `tests/test_error_parity.py`, and
+`tests/test_ws_dialect.py` guard against this SDK silently drifting from the
+server's actual protocol (canonical signing string, error code table, and
+the per-venue WS frame shapes from `trading-gateway/proxy/ws/okx.py`). All
+do this via **pinned golden constants** computed once against the server
+source and hardcoded in the test file — not a live import of
 `trading-gateway`. An earlier draft of the error-parity test *did*
 `sys.path`-import `trading-gateway` directly; that was deliberately reverted
 because a package meant to be `pip install`-able and CI-able standalone
 shouldn't have its test suite depend on a sibling directory existing on
-disk. If the server's signing logic or error codes change, update the
-pinned values in these two files by hand — each file's module docstring
-says exactly what to regenerate.
+disk. If the server's signing logic, error codes, or WS dialect change,
+update the pinned values in these files by hand — each file's module
+docstring says exactly what to regenerate.
 
 ### Security note on examples/docs
 

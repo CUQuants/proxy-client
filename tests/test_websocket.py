@@ -448,34 +448,34 @@ def test_pending_requests_routing_and_fail_all():
     async def run():
         p = _PendingRequests()
 
-        # req_id routing
+        # the client passes the dialect's correlation key alongside the frame
         assert p.next_id() == 1
         f1 = p.create(1)
-        assert p.resolve({"req_id": 1, "ok": True}) is True
+        assert p.resolve({"req_id": 1, "ok": True}, 1) is True
         assert f1.result() == {"req_id": 1, "ok": True}
 
         # order frames correlate on `id` even with no req_id present
         f2 = p.create(2)
-        assert p.resolve({"event": "result", "id": 2}) is True
+        assert p.resolve({"event": "result", "id": 2}, 2) is True
         assert f2.result()["id"] == 2
 
         # the pong occupies a reserved slot, not a numeric id
         fp = p.expect_pong()
-        assert p.resolve({"event": "pong"}) is True and fp.done()
+        assert p.resolve({"event": "pong"}, None) is True and fp.done()
         p.discard_pong()
 
         # a server-initiated push is not consumed - it goes to handlers
-        assert p.resolve({"channel": "book", "data": []}) is False
+        assert p.resolve({"channel": "book", "data": []}, None) is False
 
         # an id-less Proxy error is swallowed here, never handed to handlers
-        assert p.resolve({"event": "error", "data": {"error": {"code": "X"}}}) is True
+        assert p.resolve({"event": "error", "data": {"error": {"code": "X"}}}, None) is True
 
         # fail_all propagates to every waiter and empties the map
         f3 = p.create(3)
         p.fail_all(ConnectionError("drop"))
         with pytest.raises(ConnectionError):
             f3.result()
-        assert p.resolve({"req_id": 3}) is False
+        assert p.resolve({"req_id": 3}, 3) is False
 
     asyncio.run(run())
 
