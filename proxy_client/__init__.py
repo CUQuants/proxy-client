@@ -1,4 +1,5 @@
 from .client import ProxyClient, ProxyResult, new_idempotency_key
+from .reporting import ReportingClient
 from .orders import (
     NormalizedOrder,
     OkxOrderBuilder,
@@ -29,6 +30,7 @@ __all__ = [
     "ProxyClient",
     "ProxyResult",
     "new_idempotency_key",
+    "ReportingClient",
     "ProxyError",
     "ProxyUnreachableError",
     "AuthFailedError",

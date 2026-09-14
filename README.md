@@ -46,6 +46,11 @@ once —
   different: a dropped connection isn't a business decision the way
   resending a mutating request is, so `ProxyWebSocketClient` *does* own
   reconnection — its aggressiveness is a parameter, not a caller-built loop.
+- **A second client for a second service.** `ReportingClient` talks to
+  `proxy_admin.reporting` (the read-only audit-log API) — its own base URL,
+  its own smaller wire format, operator credentials only — sharing this
+  package's signing and error classification but nothing else with
+  `ProxyClient`. See [Reporting (audit log)](#reporting-audit-log).
 
 ## Install
 
@@ -54,9 +59,9 @@ Not yet published to a package index. Build and install the wheel directly:
 ```bash
 cd proxy-client
 make build
-pip install dist/cuq_proxy_client-0.3.0-py3-none-any.whl
+pip install dist/cuq_proxy_client-0.4.0-py3-none-any.whl
 # add [websocket] if you need ProxyWebSocketClient:
-pip install "dist/cuq_proxy_client-0.3.0-py3-none-any.whl[websocket]"
+pip install "dist/cuq_proxy_client-0.4.0-py3-none-any.whl[websocket]"
 ```
 
 or, for local development against a consumer (editable install so changes
@@ -199,6 +204,48 @@ Async equivalents are `okx_aplace_order` / `okx_acancel_order`, both real
 `await`s on `client.acall()` — the normalization itself is pure and needs no
 async form. Other exchanges and order actions (`amend_order`, batch orders)
 aren't covered yet; see `orders.py`'s module docstring before adding one.
+
+## Reporting (audit log)
+
+`ReportingClient` is a **second, separate client** for `proxy_admin.reporting`
+— `trading-gateway`'s read-only audit-log API — not a mode of `ProxyClient`.
+It's a different service: its own process, its own default port (`:8090`
+against the Proxy's `:8080`), and by design no reverse-proxy route the way
+the Proxy has one, so it almost never shares a `base_url` with a
+`ProxyClient` in the same process. It reuses this package's signing and
+error classification unchanged; everything else about the wire format is
+its own (see `reporting.py`'s module docstring for exactly what and why).
+
+```python
+from proxy_client import ReportingClient
+
+client = ReportingClient.for_operator(
+    base_url="https://your-reporting-host.example",
+    api_key="cuq_op_...",
+    secret="...",
+    operator_id="cuq-002",
+    operator_name="J. Rivera",
+)
+
+client.log_health()          # partition runway, clock skew, rows_last_24h
+client.unresolved_orders()   # forwarded to an exchange, outcome never recorded
+client.auth_failures()       # last 7 days, by key and origin
+
+page = client.query_logs(exchange="okx", response_status="error", limit=25)
+next_page = client.query_logs(exchange="okx", response_status="error",
+                               cursor=page["next_cursor"])
+```
+
+Async equivalents (`alog_health`, `aunresolved_orders`, `aauth_failures`,
+`aquery_logs`) mirror `ProxyClient`'s `acall()` — real `httpx.AsyncClient`
+I/O, not `call()` run in a thread.
+
+Operator credentials only — there's no `ReportingClient.for_system(...)`.
+"May view the audit log" is a property of a person, not a bot, even though
+the server's authorization check technically doesn't distinguish credential
+types (see the class docstring). Every method raises the same typed
+exceptions as `ProxyClient` — most notably `ActionNotPermittedError` when
+the credential is real but `operators.admin_role` is null for that operator.
 
 ## WebSocket
 
