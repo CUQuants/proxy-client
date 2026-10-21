@@ -21,9 +21,20 @@ knowing the asset codes — so it needs the AssetPairs table::
 Without that table an inbound pair raises `UnmappedVenueValue` rather than
 being guessed at.
 
-Note this is the **REST** spelling. WS v2 renamed XBT → BTC and rejects the
-old spelling (see `xlrts/src/exchange/symbols.py`); a WS adapter needs its own
-outbound map.
+WebSocket v2
+------------
+The streaming half (`ws_*`, `parse_ws_message`) speaks Kraken WS v2, which the
+Proxy relays unreshaped. WS v2 renamed XBT → BTC and **rejects** the REST
+spelling (see `xlrts/src/exchange/symbols.py`), but in exchange its symbols
+are already canonical apart from the separator — `BTC/USD` ↔ `BTC-USD` — so
+the WS side needs no AssetPairs table and never touches `venue_symbol`.
+
+WS v2 sends numbers as JSON numbers, which the transport has already parsed
+to `float` by the time a message arrives here. `Decimal(str(x))` recovers
+the shortest round-trip text, which matches the wire for the prices and
+quantities Kraken sends; it is not a substitute for parsing with
+`parse_float=Decimal`, and anything that must match Kraken's book checksum
+digit-for-digit should not rely on it.
 """
 
 from __future__ import annotations
@@ -32,12 +43,16 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Mapping
 
+from .base import StreamEvent
 from .models import (
     Balance,
+    BookLevel,
+    BookUpdate,
     Fill,
     NormalizedOrder,
     Order,
     OrderAck,
+    OrderEvent,
     OrderStatus,
     OrderType,
     Side,
@@ -76,6 +91,18 @@ _STATUSES: Mapping[str, OrderStatus] = {
 }
 
 
+#: WS v2 `order_status`. Unlike REST, v2 reports partial fills itself.
+_WS_STATUSES: Mapping[str, OrderStatus] = {
+    "pending_new": OrderStatus.PENDING,
+    "new": OrderStatus.OPEN,
+    "partially_filled": OrderStatus.PARTIALLY_FILLED,
+    "filled": OrderStatus.FILLED,
+    "canceled": OrderStatus.CANCELED,
+    "expired": OrderStatus.EXPIRED,
+}
+_LIQUIDITY: Mapping[str, bool] = {"m": True, "t": False}
+
+
 def normalize_asset(code: str) -> str:
     """`XXBT` → `BTC`, `ZUSD` → `USD`, `XBT.F` → `BTC.F`, `USDT` → `USDT`.
 
@@ -102,6 +129,18 @@ def _lookup(table: Mapping[str, Any], field_name: str, value: Any) -> Any:
 
 def _ts(seconds: Any) -> datetime:
     return datetime.fromtimestamp(float(seconds), tz=timezone.utc)
+
+
+def _iso(value: Any) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+def _dec(value: Any) -> Decimal | None:
+    return None if value is None else Decimal(str(value))
+
+
+def _ws_canonical(symbol: str) -> str:
+    return symbol.replace("/", "-")
 
 
 class KrakenSpot:
@@ -254,3 +293,90 @@ class KrakenSpot:
                 )
             )
         return out
+
+    # -- WebSocket v2 -----------------------------------------------------
+
+    def ws_executions_subscription(self) -> tuple[str, dict]:
+        # Kraken's defaults: snapshot of open orders, no trade snapshot.
+        return "executions", {}
+
+    def ws_book_subscription(self, symbols: list[str], depth: int) -> tuple[str, dict]:
+        return "book", {"symbol": [s.upper().replace("-", "/") for s in symbols], "depth": depth}
+
+    def parse_ws_message(self, raw: dict) -> list[StreamEvent]:
+        """`executions` → `OrderEvent`s and `Fill`s; `book` → `BookUpdate`s.
+
+        Other channels (heartbeat, status, ...) yield nothing. Anything the
+        caller subscribed to through `TradingStream` is one of the two.
+        """
+        channel = raw.get("channel")
+        snapshot = raw.get("type") == "snapshot"
+        rows = raw.get("data") or []
+        if channel == "executions":
+            out: list[StreamEvent] = []
+            for row in rows:
+                if row.get("exec_type") == "trade":
+                    out.append(self._parse_ws_fill(row))
+                out.append(self._parse_ws_order_event(row, snapshot))
+            return out
+        if channel == "book":
+            return [self._parse_ws_book(row, snapshot) for row in rows]
+        return []
+
+    def _parse_ws_order_event(self, row: Mapping[str, Any], snapshot: bool) -> OrderEvent:
+        status = row.get("order_status")
+        side = row.get("side")
+        return OrderEvent(
+            venue=VENUE,
+            order_id=row["order_id"],
+            status=None if status is None else _lookup(_WS_STATUSES, "order_status", status),
+            symbol=_ws_canonical(row["symbol"]) if "symbol" in row else None,
+            side=None if side is None else _lookup(_SIDES, "side", side),
+            size=_dec(row.get("order_qty")),
+            filled_size=_dec(row.get("cum_qty")),
+            avg_fill_price=_dec(row.get("avg_price")),
+            client_order_id=row.get("cl_ord_id"),
+            timestamp=_iso(row.get("timestamp")),
+            is_snapshot=snapshot,
+            raw=row,
+        )
+
+    def _parse_ws_fill(self, row: Mapping[str, Any]) -> Fill:
+        # Unlike REST, v2 names the fee asset. One entry is the only shape
+        # with an honest single `fee`; anything else is a new case to model.
+        fees = row.get("fees") or []
+        if len(fees) != 1:
+            raise UnmappedVenueValue(VENUE, "fees", fees)
+        liquidity = row.get("liquidity_ind")
+        return Fill(
+            venue=VENUE,
+            trade_id=str(row["exec_id"]),
+            order_id=row["order_id"],
+            symbol=_ws_canonical(row["symbol"]),
+            side=_lookup(_SIDES, "side", row.get("side")),
+            price=Decimal(str(row["last_price"])),
+            size=Decimal(str(row["last_qty"])),
+            fee=Decimal(str(fees[0]["qty"])),
+            fee_asset=fees[0]["asset"],
+            is_maker=None if liquidity is None else _lookup(_LIQUIDITY, "liquidity_ind", liquidity),
+            timestamp=datetime.fromisoformat(row["timestamp"]),
+            raw=row,
+        )
+
+    def _parse_ws_book(self, row: Mapping[str, Any], snapshot: bool) -> BookUpdate:
+        def levels(side: str) -> tuple[BookLevel, ...]:
+            return tuple(
+                BookLevel(Decimal(str(lv["price"])), Decimal(str(lv["qty"])))
+                for lv in row.get(side) or []
+            )
+
+        return BookUpdate(
+            venue=VENUE,
+            symbol=_ws_canonical(row["symbol"]),
+            is_snapshot=snapshot,
+            bids=levels("bids"),
+            asks=levels("asks"),
+            checksum=row.get("checksum"),
+            timestamp=_iso(row.get("timestamp")),
+            raw=row,
+        )

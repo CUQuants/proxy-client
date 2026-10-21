@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, TypedDict
+from typing import Any, NamedTuple, TypedDict
 
 __all__ = [
     "UnmappedVenueValue",
@@ -35,6 +35,9 @@ __all__ = [
     "Order",
     "Fill",
     "Balance",
+    "OrderEvent",
+    "BookLevel",
+    "BookUpdate",
 ]
 
 
@@ -140,6 +143,54 @@ class Fill:
     fee_asset: str | None   # None when the venue does not say — never assumed
     is_maker: bool | None
     timestamp: datetime
+    raw: Any = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class OrderEvent:
+    """A change to one order, from a stream.
+
+    Unlike `Order` this is a delta, not a full picture: a cancel update may
+    carry nothing but the id and the new status, so every descriptive field
+    is optional and `None` means "this message did not say".
+
+    `is_snapshot` marks state replayed on (re)subscribe rather than a change
+    that just happened. After a reconnect, treat a snapshot as the new truth
+    and reconcile anything that happened while disconnected over REST.
+    """
+
+    venue: str
+    order_id: str
+    status: OrderStatus | None
+    symbol: str | None
+    side: Side | None
+    size: Decimal | None
+    filled_size: Decimal | None
+    avg_fill_price: Decimal | None
+    client_order_id: str | None
+    timestamp: datetime | None
+    is_snapshot: bool
+    raw: Any = field(repr=False)
+
+
+class BookLevel(NamedTuple):
+    price: Decimal
+    size: Decimal       # 0 in an update means "remove this level"
+
+
+@dataclass(frozen=True, slots=True)
+class BookUpdate:
+    """One order-book message. A snapshot replaces the whole book; an update
+    changes only the listed levels. Applying them in order is the caller's
+    job — including after a reconnect, which always starts with a snapshot."""
+
+    venue: str
+    symbol: str
+    is_snapshot: bool
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    checksum: int | None
+    timestamp: datetime | None
     raw: Any = field(repr=False)
 
 

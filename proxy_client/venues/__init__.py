@@ -11,36 +11,49 @@ consumer can move over one call site at a time.
     tc = TradingClient(adapter, rest)
     fills = await tc.get_fills()          # list[Fill], Decimals, UTC datetimes
 
+    stream = TradingStream(adapter, ws)   # ws: a started ProxyWebSocketClient
+    async for event in stream.executions():   # OrderEvent | Fill
+        ...
+
 Layout:
     models.py        canonical dataclasses and enums
-    base.py          the `VenueAdapter` protocol
-    kraken_spot.py   Kraken spot REST — outbound and inbound
+    base.py          the `VenueAdapter` and `StreamAdapter` protocols
+    kraken_spot.py   Kraken spot — REST both ways, WS v2 executions + book
     okx.py           OKX — outbound only (inbound TODO)
     kraken_prime.py  Kraken Prime — placeholder; orders travel over WS
-    trading.py       `TradingClient`
+    trading.py       `TradingClient` — request/response
+    stream.py        `TradingStream` — subscriptions
 """
 
-from .base import OrderTransport, VenueAdapter
+from .base import OrderTransport, StreamAdapter, StreamEvent, VenueAdapter
 from .kraken_prime import KrakenPrime
 from .kraken_spot import KrakenSpot, normalize_asset
 from .models import (
     Balance,
+    BookLevel,
+    BookUpdate,
     Fill,
     NormalizedOrder,
     Order,
     OrderAck,
+    OrderEvent,
     OrderStatus,
     OrderType,
     Side,
     UnmappedVenueValue,
 )
 from .okx import Okx
+from .stream import StreamOverflow, TradingStream
 from .trading import TradingClient
 
 __all__ = [
     "VenueAdapter",
     "OrderTransport",
+    "StreamAdapter",
+    "StreamEvent",
     "TradingClient",
+    "TradingStream",
+    "StreamOverflow",
     "KrakenSpot",
     "KrakenPrime",
     "Okx",
@@ -50,6 +63,9 @@ __all__ = [
     "Order",
     "Fill",
     "Balance",
+    "OrderEvent",
+    "BookLevel",
+    "BookUpdate",
     "Side",
     "OrderType",
     "OrderStatus",
