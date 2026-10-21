@@ -276,7 +276,7 @@ client.add_handler("book", on_book)   # or subclass and override on_message()
 
 await client.start()
 await client.subscribe("book", {"symbol": ["BTC/USD"], "depth": 10})
-await client.run_forever()            # blocks until stop() or the connection gives up for good
+await client.run_forever()            # blocks until stop() or the connection gives up for good (raises if the Proxy refused a reconnect)
 ```
 
 The venue's own vocabulary travels verbatim — for Kraken you write the same
@@ -347,6 +347,27 @@ client = ProxyWebSocketClient.for_operator(..., reconnect=my_backoff)
 Active subscriptions are replayed automatically after every reconnect.
 `heartbeat_interval`/`heartbeat_timeout` (default 30s/10s) are plain numbers
 — pure keep-alive wire mechanics, nothing to swap in besides the timing.
+
+A reconnect the Proxy **refuses** — `AUTH_FAILED`, `CREDENTIAL_EXPIRED`, any
+handshake error whose `retryable` is `False` — is not retried, whatever the
+policy says: retrying the same credential cannot succeed. The client closes
+and `run_forever()` raises that error. Transport failures are still retried
+per `reconnect`.
+
+To react to the connection itself rather than to messages, register a
+listener. It receives a `ConnectionEvent` whose `kind` is `"disconnected"`,
+`"reconnected"` (after the replay), `"closed"` (gone for good, `error` says
+why) or `"stopped"`:
+
+```python
+from proxy_client.websocket import ConnectionEvent
+
+def on_connection(event: ConnectionEvent) -> None:
+    if event.kind == "disconnected":
+        ...  # anything sent while down is lost — reconcile over REST later
+
+client.add_connection_listener(on_connection)
+```
 
 ### Handlers are the app-level seam
 

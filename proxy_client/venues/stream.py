@@ -4,18 +4,29 @@
 different shape: a subscription is an async iterator, not a call::
 
     stream = TradingStream(adapter, ws)        # ws: a started ProxyWebSocketClient
-    async for event in stream.executions():    # OrderEvent | Fill
+    async for event in stream.executions():    # OrderEvent | Fill | StreamGap
         ...
     async for update in stream.book(["BTC-USD"], depth=10):
         ...
 
 The socket is the caller's: start it, stop it, share it with a
 `TradingClient`. This class only registers a handler, subscribes, and turns
-messages into events. Reconnects are the socket's job too — it replays every
-subscription, so after a drop the iterator simply receives a fresh snapshot
-(`is_snapshot=True`). A snapshot always means "replace your state"; anything
-that happened while disconnected (fills especially) has to be reconciled over
-REST with `TradingClient`.
+messages into events.
+
+Disconnects
+-----------
+The socket reconnects and replays subscriptions on its own. What the iterator
+adds is that a consumer can never miss that it happened:
+
+- **Drop** → a `StreamGap` is yielded, in order with the events around it.
+  Anything sent while disconnected is lost. The venue's next snapshot
+  (`is_snapshot=True`) replaces state; fills from the gap have to be
+  reconciled over REST with `TradingClient`.
+- **`stop()`** → the iterator ends normally.
+- **Gone for good** (reconnect disabled, policy gave up, handshake refused)
+  → the iterator raises `ConnectionError`, chained to the cause. It never
+  just stops yielding: a trading loop parked forever on a dead feed is the
+  failure this exists to prevent.
 
 Failures reach the consumer
 ---------------------------
@@ -43,16 +54,35 @@ import logging
 from contextlib import aclosing
 from typing import Any, AsyncIterator, Callable
 
+from dataclasses import dataclass
+
 from .base import StreamAdapter, StreamEvent
 from .models import BookUpdate, Fill, OrderEvent
 
-__all__ = ["TradingStream", "StreamOverflow"]
+__all__ = ["TradingStream", "StreamGap", "StreamOverflow"]
 
 logger = logging.getLogger(__name__)
 
 
 class StreamOverflow(RuntimeError):
     """The consumer fell behind by more than `max_queue` events."""
+
+
+@dataclass(frozen=True, slots=True)
+class StreamGap:
+    """The socket dropped here; events may be missing from this point until
+    the next snapshot. `error` is what ended the connection, if known."""
+
+    error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _End:
+    """Queued by the connection listener so the end arrives *after* the
+    events already queued, not instead of them."""
+
+    error: BaseException | None
+    stopped: bool
 
 
 class TradingStream:
@@ -65,7 +95,7 @@ class TradingStream:
         self._executions_active = False
         self._book_symbols: set[str] = set()
 
-    async def executions(self) -> AsyncIterator[OrderEvent | Fill]:
+    async def executions(self) -> AsyncIterator[OrderEvent | Fill | StreamGap]:
         """Every order change and fill on the account.
 
         On the Proxy's shared vaulted key that means *every member's* orders,
@@ -87,7 +117,9 @@ class TradingStream:
         finally:
             self._executions_active = False
 
-    async def book(self, symbols: list[str], *, depth: int = 10) -> AsyncIterator[BookUpdate]:
+    async def book(
+        self, symbols: list[str], *, depth: int = 10
+    ) -> AsyncIterator[BookUpdate | StreamGap]:
         """Book snapshots and updates for canonical `symbols`."""
         wanted = {s.upper() for s in symbols}
         overlap = wanted & self._book_symbols
@@ -131,11 +163,19 @@ class TradingStream:
                 if accept(event):
                     offer(event)
 
+        def on_connection(event: Any) -> None:
+            if event.kind == "disconnected":
+                offer(StreamGap(event.error))
+            elif event.kind in ("closed", "stopped"):
+                offer(_End(event.error, stopped=event.kind == "stopped"))
+
         # Handler first, subscribe second: the snapshot can arrive before
         # `subscribe()` returns, and it must not be missed.
         self._ws.add_handler(channel, handler)
+        self._ws.add_connection_listener(on_connection)
         try:
             await self._ws.subscribe(channel, params)
+            socket_gone = False
             try:
                 while True:
                     item = await queue.get()
@@ -144,13 +184,24 @@ class TradingStream:
                             f"{self.venue.name} {channel}: consumer fell more than "
                             f"{self._max_queue} events behind"
                         )
+                    if isinstance(item, _End):
+                        socket_gone = True
+                        if item.stopped:
+                            return
+                        raise ConnectionError(
+                            f"{self.venue.name} {channel}: the WebSocket closed for good"
+                        ) from item.error
                     if isinstance(item, Exception):
                         raise item
                     yield item
             finally:
-                try:
-                    await self._ws.unsubscribe(channel, params)
-                except Exception:  # noqa: BLE001 — never mask why the stream ended
-                    logger.exception("unsubscribe from %s failed", channel)
+                if not socket_gone:
+                    try:
+                        await self._ws.unsubscribe(channel, params)
+                    except Exception as exc:  # noqa: BLE001 — never mask why the stream ended
+                        # Already forgotten client-side, so it will not be
+                        # replayed; the venue drops it with the socket anyway.
+                        logger.warning("unsubscribe from %s failed: %s", channel, exc)
         finally:
+            self._ws.remove_connection_listener(on_connection)
             self._ws.remove_handler(channel, handler)

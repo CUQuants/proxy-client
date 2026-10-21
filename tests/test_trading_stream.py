@@ -13,10 +13,12 @@ from proxy_client.venues import (
     Fill,
     KrakenSpot,
     OrderEvent,
+    StreamGap,
     StreamOverflow,
     TradingStream,
     UnmappedVenueValue,
 )
+from proxy_client.websocket import ConnectionEvent
 
 
 class FakeWS:
@@ -25,6 +27,17 @@ class FakeWS:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
         self.handlers: dict[str, list] = {}
+        self.listeners: list = []
+
+    def add_connection_listener(self, listener):
+        self.listeners.append(listener)
+
+    def remove_connection_listener(self, listener):
+        self.listeners.remove(listener)
+
+    def emit(self, kind: str, error: BaseException | None = None) -> None:
+        for listener in list(self.listeners):
+            listener(ConnectionEvent(kind, error))
 
     def add_handler(self, channel, handler):
         self.calls.append(("add_handler", channel))
@@ -170,5 +183,69 @@ def test_fills_and_order_events_both_come_through_executions():
         assert isinstance(await first, Fill)
         assert isinstance(await gen.__anext__(), OrderEvent)
         await gen.aclose()
+
+    asyncio.run(run())
+
+
+# -- disconnects ---------------------------------------------------------------
+
+
+def test_drop_yields_a_gap_in_order_with_surrounding_events():
+    async def run():
+        ws = FakeWS()
+        gen = TradingStream(KrakenSpot(), ws).executions()
+        first = await _started(gen)
+        drop = ConnectionResetError("peer reset")
+        ws.push(_execution("O1"))
+        ws.emit("disconnected", drop)
+        ws.push(_execution("O2"))
+        assert (await first).order_id == "O1"
+        gap = await gen.__anext__()
+        assert isinstance(gap, StreamGap) and gap.error is drop
+        assert (await gen.__anext__()).order_id == "O2"
+        await gen.aclose()
+
+    asyncio.run(run())
+
+
+def test_stop_ends_the_iterator_cleanly_without_unsubscribing():
+    async def run():
+        ws = FakeWS()
+        gen = TradingStream(KrakenSpot(), ws).executions()
+        first = await _started(gen)
+        ws.emit("stopped")
+        with pytest.raises(StopAsyncIteration):
+            await first
+        assert not any(c[0] == "unsubscribe" for c in ws.calls)
+        assert ws.listeners == [] and ws.handlers["executions"] == []
+
+    asyncio.run(run())
+
+
+def test_closed_for_good_raises_after_delivering_queued_events():
+    async def run():
+        ws = FakeWS()
+        gen = TradingStream(KrakenSpot(), ws).book(["BTC-USD"])
+        first = await _started(gen)
+        cause = RuntimeError("reconnect gave up")
+        ws.push(_book("BTC/USD"))
+        ws.emit("closed", cause)
+        assert isinstance(await first, BookUpdate)
+        with pytest.raises(ConnectionError) as exc:
+            await gen.__anext__()
+        assert exc.value.__cause__ is cause
+
+    asyncio.run(run())
+
+
+def test_a_parked_consumer_is_woken_by_close():
+    """The original bug: nothing queued, socket gone, consumer waits forever."""
+    async def run():
+        ws = FakeWS()
+        gen = TradingStream(KrakenSpot(), ws).executions()
+        first = await _started(gen)
+        ws.emit("closed")
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(first, timeout=1)
 
     asyncio.run(run())

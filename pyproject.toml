@@ -13,12 +13,12 @@ dependencies = [
 
 [project.optional-dependencies]
 websocket = [
-    "websockets>=13",
+    "websockets>=14",
 ]
 dev = [
     "pytest>=8.3",
     "build>=1.0",
-    "websockets>=13",
+    "websockets>=14",
 ]
 
 [tool.setuptools]

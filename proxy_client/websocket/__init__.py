@@ -78,10 +78,11 @@ except ImportError as _exc:  # pragma: no cover
 
 from ._backoff import ReconnectBackoff, default_backoff
 from ._dialect import Dialect, KrakenDialect, OKXDialect, WebSocketRequestError
-from .client import ProxyWebSocketClient
+from .client import ConnectionEvent, ProxyWebSocketClient
 
 __all__ = [
     "ProxyWebSocketClient",
+    "ConnectionEvent",
     "ReconnectBackoff",
     "default_backoff",
     "WebSocketRequestError",

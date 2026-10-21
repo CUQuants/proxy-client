@@ -14,22 +14,45 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
 
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
+from ..errors import ProxyError
 from ..idempotency import new_idempotency_key
 from ._backoff import ReconnectBackoff, default_backoff
 from ._connection import _build_auth_frame, _build_ws_url, _Connection
 from ._dialect import Dialect, WebSocketRequestError, dialect_for_exchange
 from ._rpc import _PendingRequests
 
-__all__ = ["ProxyWebSocketClient", "WebSocketRequestError"]
+__all__ = ["ConnectionEvent", "ProxyWebSocketClient", "WebSocketRequestError"]
 
 logger = logging.getLogger(__name__)
 
 # A channel handler receives the full parsed message dict; may be sync or async.
 MessageHandler = Callable[[dict], Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionEvent:
+    """A change in the connection's lifecycle, for `add_connection_listener`.
+
+    - ``disconnected``: the socket dropped; a reconnect will be attempted.
+      Anything sent on it in the meantime may have been missed.
+    - ``reconnected``: a fresh socket is up and every persisted subscription
+      has been replayed onto it.
+    - ``closed``: the connection is gone **for good** without `stop()` being
+      called — reconnect disabled, the policy gave up, or the Proxy refused
+      the handshake (`error` says which).
+    - ``stopped``: `stop()` was called.
+    """
+
+    kind: Literal["disconnected", "reconnected", "closed", "stopped"]
+    error: BaseException | None = None
+
+
+ConnectionListener = Callable[[ConnectionEvent], Any]
 
 # A connection that stays up at least this long before dropping resets the
 # reconnect attempt counter, so its next backoff starts from the bottom.
@@ -131,10 +154,15 @@ class ProxyWebSocketClient:
         self._shutdown_event = asyncio.Event()
         self._supervise_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._replay_task: asyncio.Task | None = None
+        # Set when the Proxy refuses a reconnect handshake outright; re-raised
+        # from `run_forever()` so it cannot end quietly.
+        self._fatal_error: ProxyError | None = None
 
         self._pending = _PendingRequests()
 
         self._handlers: dict[str, list[MessageHandler]] = {}
+        self._connection_listeners: list[ConnectionListener] = []
 
         # (channel, params) recorded via subscribe(); replayed in order
         # after every reconnect.
@@ -242,6 +270,7 @@ class ProxyWebSocketClient:
             raise RuntimeError("Client is already running.")
         self._running = True
         self._shutdown_event.clear()
+        self._fatal_error = None
 
         self._conn = _Connection(self._url, self._auth_frame, timeout=self._timeout)
         await self._conn.open()
@@ -262,7 +291,7 @@ class ProxyWebSocketClient:
         self._running = False
         self._shutdown_event.set()
 
-        for task in (self._supervise_task, self._heartbeat_task):
+        for task in (self._supervise_task, self._heartbeat_task, self._replay_task):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -275,12 +304,20 @@ class ProxyWebSocketClient:
         self._conn = None
 
         self._pending.cancel_all()
+        await self._emit(ConnectionEvent("stopped"))
         logger.info("ProxyWebSocketClient stopped.")
 
     async def run_forever(self) -> None:
         """Block until `stop()` is called, or the connection ends for good
-        (reconnect disabled, or the `reconnect` callable returned `None`)."""
+        (reconnect disabled, or the `reconnect` callable returned `None`).
+
+        Raises the Proxy's error if it refused a reconnect handshake outright
+        (`AuthFailedError`, `CredentialExpiredError`, ...): a revoked or
+        expired credential must stop the process loudly, not retry forever.
+        """
         await self._shutdown_event.wait()
+        if self._fatal_error is not None:
+            raise self._fatal_error
 
     async def __aenter__(self) -> "ProxyWebSocketClient":
         await self.start()
@@ -390,13 +427,16 @@ class ProxyWebSocketClient:
     async def unsubscribe(self, channel: str, params: dict | None = None) -> dict:
         params = dict(params or {})
         params["channel"] = channel
-        response = await self.request("unsubscribe", params=params)
+        # Forget it *before* asking the venue. If the request fails — most
+        # often because the socket is down — the caller still meant to stop,
+        # and a registry entry left behind would be resubscribed on the next
+        # reconnect with no handler listening.
         clean = {k: v for k, v in params.items() if k != "channel"}
         try:
             self._subscriptions.remove((channel, clean))
         except ValueError:
             pass
-        return response
+        return await self.request("unsubscribe", params=params)
 
     # -- handler registration ----------------------------------------------
 
@@ -420,6 +460,29 @@ class ProxyWebSocketClient:
         else:
             self._handlers.pop(channel, None)
 
+    def add_connection_listener(self, listener: ConnectionListener) -> None:
+        """Register a callback for `ConnectionEvent`s (sync or async). Errors
+        it raises go to `on_error`, as for channel handlers."""
+        self._connection_listeners.append(listener)
+
+    def remove_connection_listener(self, listener: ConnectionListener) -> None:
+        try:
+            self._connection_listeners.remove(listener)
+        except ValueError:
+            pass
+
+    async def _emit(self, event: ConnectionEvent) -> None:
+        for listener in list(self._connection_listeners):
+            try:
+                result = listener(event)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001
+                if self._on_error is not None:
+                    self._on_error(exc)
+                else:
+                    logger.exception("Connection listener raised for %s", event.kind)
+
     async def on_message(self, _message: dict) -> None:
         """Called for every inbound message before channel handlers.
         Override in a subclass; default is a no-op."""
@@ -436,29 +499,71 @@ class ProxyWebSocketClient:
             last_error = await self._pump()
             if not self._running:
                 return
+            await self._connection_lost(last_error)
 
-            # The socket - and every server-side req_id with it - is gone.
-            # Fail in-flight request()s now rather than let their callers
-            # wait out a timeout that can no longer succeed.
-            self._pending.fail_all(_as_connection_error(last_error))
-
-            decision = self._decide_reconnect(attempt, last_error)
-            if decision is None:
-                self._running = False
-                self._shutdown_event.set()
-                return
-            attempt, delay = decision
-
-            if delay > 0:
-                logger.info("Reconnecting in %.1fs (attempt %d) ...", delay, attempt)
-                try:
-                    await asyncio.sleep(delay)
-                except asyncio.CancelledError:
+            # Retry until a socket is up, the policy gives up, or the Proxy
+            # refuses the handshake outright.
+            while True:
+                decision = self._decide_reconnect(attempt, last_error)
+                if decision is None:
+                    await self._close_for_good(last_error)
                     return
-            if not self._running:
-                return
+                attempt, delay = decision
 
-            await self._reconnect_once()
+                if delay > 0:
+                    logger.info("Reconnecting in %.1fs (attempt %d) ...", delay, attempt)
+                    try:
+                        await asyncio.sleep(delay)
+                    except asyncio.CancelledError:
+                        return
+                if not self._running:
+                    return
+
+                try:
+                    await self._reconnect_once()
+                    break
+                except ProxyError as exc:
+                    if exc.retryable is False:
+                        # AUTH_FAILED, CREDENTIAL_EXPIRED, ...: retrying the
+                        # same credential cannot succeed, and under a backoff
+                        # that never gives up it would retry forever, quietly.
+                        logger.error("The Proxy refused the reconnect handshake: %s", exc)
+                        self._fatal_error = exc
+                        await self._close_for_good(exc)
+                        return
+                    logger.error("Reconnect attempt failed: %s", exc)
+                    last_error = exc
+                except Exception as exc:  # noqa: BLE001 - transport; retry per policy
+                    logger.error("Reconnect attempt failed: %s", exc)
+                    last_error = exc
+
+            # Replay *alongside* the pump, never before it: each replayed
+            # subscribe awaits an ack that only `_pump` reads. Replaying first
+            # blocked every message for `timeout` seconds per subscription.
+            self._replay_task = asyncio.create_task(
+                self._replay_then_announce(), name="proxy-ws-replay"
+            )
+
+    async def _connection_lost(self, error: BaseException | None) -> None:
+        if self._replay_task is not None and not self._replay_task.done():
+            self._replay_task.cancel()
+        # The socket - and every server-side req_id with it - is gone.
+        # Fail in-flight request()s now rather than let their callers
+        # wait out a timeout that can no longer succeed.
+        self._pending.fail_all(_as_connection_error(error))
+        await self._emit(ConnectionEvent("disconnected", error))
+
+    async def _close_for_good(self, error: BaseException | None) -> None:
+        """The connection is over without `stop()`. Same end state as
+        `stop()`, called from inside the supervisor."""
+        self._running = False
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        if self._conn is not None:
+            await self._conn.close()
+        self._pending.cancel_all()
+        await self._emit(ConnectionEvent("closed", error))
+        self._shutdown_event.set()
 
     async def _pump(self) -> BaseException | None:
         """Read and dispatch frames until the connection ends. Returns the
@@ -521,16 +626,19 @@ class ProxyWebSocketClient:
         return attempt, delay
 
     async def _reconnect_once(self) -> None:
-        """Build a fresh connection and replay subscriptions onto it. A
-        failure here is logged and swallowed: the supervisor loops, the
-        next `_pump` raises immediately on the dead connection, and we
-        land back in `_decide_reconnect` with `attempt` advanced."""
+        """Open a fresh, authenticated connection, or raise. A failed attempt
+        closes whatever half-open socket it left behind; `self._conn` keeps
+        `connected_at=None`, so `_decide_reconnect` advances `attempt`."""
+        self._conn = _Connection(self._url, self._auth_frame, timeout=self._timeout)
         try:
-            self._conn = _Connection(self._url, self._auth_frame, timeout=self._timeout)
             await self._conn.open()
-            await self._replay_subscriptions()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Reconnect attempt failed: %s", exc)
+        except Exception:
+            await self._conn.close()
+            raise
+
+    async def _replay_then_announce(self) -> None:
+        await self._replay_subscriptions()
+        await self._emit(ConnectionEvent("reconnected"))
 
     async def _replay_subscriptions(self) -> None:
         if not self._subscriptions:

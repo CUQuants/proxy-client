@@ -8,7 +8,7 @@ import pytest
 import websockets
 
 from proxy_client.errors import AuthFailedError, RateLimitedError
-from proxy_client.websocket import ProxyWebSocketClient, WebSocketRequestError
+from proxy_client.websocket import ConnectionEvent, ProxyWebSocketClient, WebSocketRequestError
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -497,3 +497,147 @@ def test_in_flight_request_fails_fast_when_connection_drops():
             await client.stop()
 
     asyncio.run(run())
+
+
+# -- reconnect hardening -------------------------------------------------------
+
+
+def _ack_subscribe(req: dict) -> str:
+    return json.dumps({"method": "subscribe", "success": True, "req_id": req["req_id"]})
+
+
+def test_replay_runs_alongside_the_pump_so_messages_are_not_stalled():
+    """Replay used to run before the read loop restarted, so each replayed
+    subscribe waited out its full 10s timeout with no messages delivered."""
+    connects = 0
+
+    async def handler(ws):
+        nonlocal connects
+        connects += 1
+        await _accept_auth(ws)
+        await ws.send(_ack_subscribe(json.loads(await ws.recv())))
+        if connects == 1:
+            await ws.close()
+            return
+        await ws.send(json.dumps({"channel": "ticker", "data": [{"n": connects}]}))
+        await ws.wait_closed()
+
+    async def run():
+        async with _fake_proxy(handler) as base_url:
+            client = _client(base_url, reconnect=lambda attempt: 0.01)
+            got = asyncio.Event()
+            events: list[str] = []
+            client.add_handler("ticker", lambda msg: got.set())
+            client.add_connection_listener(lambda ev: events.append(ev.kind))
+            await client.start()
+            await client.subscribe("ticker", {"symbol": ["BTC/USD"]})
+            await asyncio.wait_for(got.wait(), timeout=2)  # was ~10s
+            for _ in range(50):  # `reconnected` lands once the replay ack is read
+                if "reconnected" in events:
+                    break
+                await asyncio.sleep(0.01)
+            await client.stop()
+            return events
+
+    events = asyncio.run(run())
+    assert events == ["disconnected", "reconnected", "stopped"]
+
+
+def test_auth_refused_on_reconnect_stops_and_is_raised_from_run_forever():
+    connects = 0
+
+    async def handler(ws):
+        nonlocal connects
+        connects += 1
+        await ws.recv()
+        if connects == 1:
+            await ws.send(json.dumps({"event": "auth", "code": "0"}))
+            await ws.close()
+        else:
+            await ws.send(json.dumps({"event": "error", "code": "AUTH_FAILED",
+                                      "message": "authentication failed"}))
+
+    async def run():
+        async with _fake_proxy(handler) as base_url:
+            # A policy that never gives up: only the fatal classification
+            # stops it.
+            client = _client(base_url, reconnect=lambda attempt: 0.01)
+            events: list[ConnectionEvent] = []
+            client.add_connection_listener(events.append)
+            await client.start()
+            with pytest.raises(AuthFailedError):
+                await asyncio.wait_for(client.run_forever(), timeout=5)
+            return events
+
+    events = asyncio.run(run())
+    assert connects == 2  # refused once, never retried
+    assert [e.kind for e in events] == ["disconnected", "closed"]
+    assert isinstance(events[-1].error, AuthFailedError)
+
+
+def test_transient_reconnect_failure_is_still_retried():
+    connects = 0
+
+    async def handler(ws):
+        nonlocal connects
+        connects += 1
+        if connects == 2:
+            await ws.close()  # transport-level failure mid-handshake
+            return
+        await _accept_auth(ws)
+        if connects == 1:
+            await ws.close()
+        else:
+            await ws.wait_closed()
+
+    async def run():
+        async with _fake_proxy(handler) as base_url:
+            client = _client(base_url, reconnect=lambda attempt: 0.01)
+            reconnected = asyncio.Event()
+            client.add_connection_listener(
+                lambda ev: reconnected.set() if ev.kind == "reconnected" else None
+            )
+            await client.start()
+            await asyncio.wait_for(reconnected.wait(), timeout=5)
+            await client.stop()
+
+    asyncio.run(run())
+    assert connects == 3
+
+
+def test_reconnect_disabled_emits_closed():
+    async def handler(ws):
+        await _accept_auth(ws)
+        await ws.close()
+
+    async def run():
+        async with _fake_proxy(handler) as base_url:
+            client = _client(base_url, reconnect=None)
+            kinds: list[str] = []
+            client.add_connection_listener(lambda ev: kinds.append(ev.kind))
+            await client.start()
+            await asyncio.wait_for(client.run_forever(), timeout=5)  # returns, does not raise
+            return kinds
+
+    assert asyncio.run(run()) == ["disconnected", "closed"]
+
+
+def test_unsubscribe_while_disconnected_still_forgets_the_subscription():
+    async def handler(ws):
+        await _accept_auth(ws)
+        await ws.send(_ack_subscribe(json.loads(await ws.recv())))
+        await ws.close()
+
+    async def run():
+        async with _fake_proxy(handler) as base_url:
+            client = _client(base_url, reconnect=None)
+            await client.start()
+            await client.subscribe("ticker", {"symbol": ["BTC/USD"]})
+            await asyncio.wait_for(client.run_forever(), timeout=5)
+            with pytest.raises(RuntimeError):
+                await client.unsubscribe("ticker", {"symbol": ["BTC/USD"]})
+            return client._subscriptions
+
+    # Left behind, it would be resubscribed on the next connection with no
+    # handler listening.
+    assert asyncio.run(run()) == []

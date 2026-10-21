@@ -17,7 +17,8 @@ import time
 import uuid
 from typing import Any, Callable
 
-import websockets
+from websockets.asyncio.client import connect
+from websockets.protocol import State
 
 from ..errors import ProxyUnreachableError, from_response
 from ..signing import compute_signature
@@ -95,22 +96,18 @@ class _Connection:
 
     @property
     def is_open(self) -> bool:
-        """True while the socket is usable. Absorbs the `websockets` API
-        difference: <13 exposes a `.closed` bool, >=13 exposes
-        `.close_code` (None = still open)."""
-        if self._ws is None:
-            return False
-        closed_attr = getattr(self._ws, "closed", None)
-        if closed_attr is not None:
-            return not bool(closed_attr)
-        return getattr(self._ws, "close_code", None) is None
+        """True while the socket is usable — `OPEN`, not merely not-yet-closed:
+        a socket in its closing handshake can no longer be sent on."""
+        return self._ws is not None and self._ws.state is State.OPEN
 
     async def open(self) -> None:
         """Connect and complete the handshake. Raises a typed `ProxyError`
         on a rejected handshake, or `ProxyUnreachableError` /
         `WebSocketException` / `OSError` on a transport failure."""
         logger.info("Connecting to %s ...", self._url)
-        self._ws = await websockets.connect(
+        # The asyncio implementation, named explicitly: on websockets 13 the
+        # top-level `websockets.connect` was still the legacy one.
+        self._ws = await connect(
             self._url,
             ping_interval=None,   # heartbeat is driven by the client's loop
             ping_timeout=None,

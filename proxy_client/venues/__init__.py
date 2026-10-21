@@ -12,7 +12,7 @@ consumer can move over one call site at a time.
     fills = await tc.get_fills()          # list[Fill], Decimals, UTC datetimes
 
     stream = TradingStream(adapter, ws)   # ws: a started ProxyWebSocketClient
-    async for event in stream.executions():   # OrderEvent | Fill
+    async for event in stream.executions():   # OrderEvent | Fill | StreamGap
         ...
 
 Layout:
@@ -43,7 +43,7 @@ from .models import (
     UnmappedVenueValue,
 )
 from .okx import Okx
-from .stream import StreamOverflow, TradingStream
+from .stream import StreamGap, StreamOverflow, TradingStream
 from .trading import TradingClient
 
 __all__ = [
@@ -54,6 +54,7 @@ __all__ = [
     "TradingClient",
     "TradingStream",
     "StreamOverflow",
+    "StreamGap",
     "KrakenSpot",
     "KrakenPrime",
     "Okx",
