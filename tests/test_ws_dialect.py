@@ -29,6 +29,11 @@ def test_dialect_for_exchange_known():
     assert isinstance(dialect_for_exchange("okx"), OKXDialect)
 
 
+def test_kraken_prime_speaks_kraken():
+    """The gateway adds ``account_id`` itself; the client sends plain Kraken."""
+    assert isinstance(dialect_for_exchange("kraken_prime"), KrakenDialect)
+
+
 def test_dialect_for_exchange_unknown_raises_valueerror():
     with pytest.raises(ValueError):
         dialect_for_exchange("gemini")

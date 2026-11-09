@@ -242,6 +242,10 @@ class OKXDialect(Dialect):
 
 _BUILTIN: dict[str, type[Dialect]] = {
     "kraken": KrakenDialect,
+    # The club's Kraken Prime account. Same Kraken WS v2 vocabulary: the
+    # gateway adds ``account_id`` to private frames itself and refuses one
+    # from the client, so the client speaks plain Kraken.
+    "kraken_prime": KrakenDialect,
     "okx": OKXDialect,
 }
 
