@@ -285,6 +285,12 @@ The venue's own vocabulary travels verbatim — for Kraken you write the same
 are handled for you: the signed handshake (identical mechanism to REST's
 `compute_signature`, just over `WS`), and everything below.
 
+### Kraken Prime
+
+Pass `exchange="kraken_prime"`. It uses the Kraken dialect unchanged and
+connects to `/v1/kraken_prime/ws`. Don't send `account_id`: the gateway adds
+the Prime account to every private frame itself and refuses one from a client.
+
 ### OKX
 
 Pass `exchange="okx"`. Everything above is the same; only the wire

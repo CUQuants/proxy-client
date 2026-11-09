@@ -497,3 +497,11 @@ def test_in_flight_request_fails_fast_when_connection_drops():
             await client.stop()
 
     asyncio.run(run())
+
+
+def test_kraken_prime_client_uses_the_prime_route_and_kraken_dialect():
+    from proxy_client.websocket import KrakenDialect
+
+    client = _client("https://proxy.test", exchange="kraken_prime")
+    assert client._url == "wss://proxy.test/v1/kraken_prime/ws"
+    assert isinstance(client._dialect, KrakenDialect)
