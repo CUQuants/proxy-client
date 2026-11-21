@@ -105,6 +105,57 @@ class ExchangeError(ProxyError):
     def outcome_unknown(self) -> bool:
         return bool(isinstance(self.detail, dict) and self.detail.get("outcome_unknown"))
 
+    @property
+    def venue_error(self) -> str | None:
+        """The exchange's own error text, e.g. ``"EOrder:Unknown order"``.
+
+        The Proxy's `message` is deliberately generic ("The exchange rejected
+        or failed the request."); what the venue actually said travels in
+        `detail`, in a shape that depends on the path:
+
+        - Kraken WS order rejection: ``detail["error"]`` (a string)
+        - Kraken REST: ``detail["kraken_error"]`` (a list of strings)
+        - OKX REST: ``detail["body"]["data"][i]["sMsg"]`` or ``detail["body"]["msg"]``
+
+        Several strings are joined with ``"; "``. `None` when the venue said
+        nothing the SDK recognises (e.g. a timeout — check `outcome_unknown`).
+        """
+        return _venue_error_text(self.detail)
+
+    def __str__(self) -> str:
+        # Callers that branch on `"Unknown order" in str(e)` (as code written
+        # against the venue directly does) keep working through the Proxy.
+        base = super().__str__()
+        venue = self.venue_error
+        return f"{base} [{venue}]" if venue else base
+
+
+def _venue_error_text(detail: Any) -> str | None:
+    if not isinstance(detail, dict):
+        return None
+    found: list[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value:
+            found.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                add(item)
+
+    add(detail.get("error"))
+    add(detail.get("kraken_error"))
+    body = detail.get("body")
+    if not found and isinstance(body, dict):
+        add(body.get("error"))  # Kraken envelope, if `kraken_error` was absent
+        for row in body.get("data") or []:
+            if isinstance(row, dict):
+                add(row.get("sMsg"))
+        if not found:
+            add(body.get("msg"))
+    # Order-preserving de-duplication (Kraken WS and REST can both be present).
+    unique = list(dict.fromkeys(found))
+    return "; ".join(unique) if unique else None
+
 
 class MalformedRequestError(ProxyError):
     """The envelope itself didn't parse. Almost always an SDK bug, not a
@@ -223,6 +274,12 @@ def from_response(
     if cls is None:
         return ProxyError(message, detail=detail, request_id=request_id, code=code)
     if cls is RateLimitedError:
+        # Over WebSocket there is no `Retry-After` header; the Proxy puts the
+        # same number in `detail.retry_after_seconds` (proxy/ratelimit.py).
+        if retry_after is None and isinstance(detail, dict):
+            hinted = detail.get("retry_after_seconds")
+            if isinstance(hinted, (int, float)) and not isinstance(hinted, bool):
+                retry_after = float(hinted)
         return RateLimitedError(
             message, detail=detail, request_id=request_id, retry_after=retry_after
         )

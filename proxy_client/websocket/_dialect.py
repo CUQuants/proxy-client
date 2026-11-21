@@ -158,9 +158,13 @@ class KrakenDialect(Dialect):
                 message = err.get("message", "the Proxy rejected the request")
                 detail = err.get("detail")
             else:
+                # proxy/ws/session.py `_send_error` puts `detail` at the top
+                # level (Kraken's error text, `outcome_unknown`,
+                # `retry_after_seconds`, …). Reading only `data` here used to
+                # drop it, so callers never saw e.g. "EOrder:Unknown order".
                 code = str(msg.get("code", "UNKNOWN"))
                 message = msg.get("message", "the Proxy rejected the request")
-                detail = data
+                detail = msg["detail"] if "detail" in msg else data
             return from_response(
                 code, message, detail=detail, request_id=msg.get("request_id", "")
             )

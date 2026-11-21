@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from proxy_client.errors import ActionNotPermittedError, RateLimitedError
+from proxy_client.errors import ActionNotPermittedError, ExchangeError, RateLimitedError
 from proxy_client.websocket import (
     Dialect,
     KrakenDialect,
@@ -103,6 +103,51 @@ def test_kraken_error_of_proxy_code_nested_and_toplevel():
         {"event": "error", "code": "RATE_LIMITED", "message": "slow", "request_id": "r2"}
     )
     assert isinstance(toplevel, RateLimitedError) and toplevel.request_id == "r2"
+
+
+def test_kraken_error_of_keeps_toplevel_detail():
+    # Exactly what proxy/ws/session.py `_send_error` sends for a Prime amend
+    # Kraken declined: KrakenDialect.error_envelope fields + the Proxy's own,
+    # with `detail` at the top level (no `data`). It used to be dropped.
+    exc = KrakenDialect().error_of(
+        {
+            "method": "amend_order",
+            "req_id": 7,
+            "success": False,
+            "event": "error",
+            "code": "EXCHANGE_ERROR",
+            "message": "The exchange rejected or failed the request.",
+            "request_id": "r7",
+            "detail": {
+                "error": "EOrder:Unknown order",
+                "exchange": "kraken_prime",
+                "outcome_unknown": False,
+            },
+        }
+    )
+    assert isinstance(exc, ExchangeError)
+    assert exc.detail["error"] == "EOrder:Unknown order"
+    assert exc.outcome_unknown is False
+    assert exc.venue_error == "EOrder:Unknown order"
+    assert "Unknown order" in str(exc)
+
+
+def test_kraken_error_of_rate_limited_retry_after_from_detail():
+    exc = KrakenDialect().error_of(
+        {
+            "method": "amend_order",
+            "req_id": 8,
+            "success": False,
+            "event": "error",
+            "code": "RATE_LIMITED",
+            "message": "Too many requests.",
+            "request_id": "r8",
+            "detail": {"scope": "caller", "reason": "rate limit", "retry_after_seconds": 1.047},
+        }
+    )
+    assert isinstance(exc, RateLimitedError)
+    assert exc.retry_after == pytest.approx(1.047)
+    assert exc.detail["scope"] == "caller"
 
 
 def test_kraken_error_of_native_rejection():
