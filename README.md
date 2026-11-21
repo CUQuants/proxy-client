@@ -432,6 +432,26 @@ except ExchangeError as e:
         raise
 ```
 
+To see *what* the exchange said, use `ExchangeError.venue_error`. The
+Proxy's `message` is deliberately generic, and the venue's own text is in
+`detail`:
+
+```python
+except ExchangeError as e:
+    if e.venue_error and "Unknown order" in e.venue_error:
+        ...  # the order already filled or was cancelled
+```
+
+`str(e)` also ends with the venue text in brackets, for example
+`EXCHANGE_ERROR: The exchange rejected or failed the request. [EOrder:Unknown order]`.
+That keeps code written against the exchange directly working through the
+Proxy. `venue_error` is `None` when the venue said nothing, such as on a
+timeout.
+
+On the WebSocket, `RateLimitedError.retry_after` comes from the error
+frame's `detail.retry_after_seconds`, because there's no `Retry-After`
+header.
+
 An unrecognised code (e.g. a new one the server starts sending before this
 SDK knows about it) falls back to the base `ProxyError` with
 `retryable = False` — fails closed rather than guessing.

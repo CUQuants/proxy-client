@@ -113,3 +113,77 @@ def test_reserved_milestone_5_codes_are_recognised_ahead_of_the_server_sending_t
     kill = from_response("KILL_SWITCH_ACTIVE", "trading halted")
     assert isinstance(risk, RiskLimitExceededError)
     assert isinstance(kill, KillSwitchActiveError)
+
+
+# -- ExchangeError.venue_error ------------------------------------------------
+# Detail shapes pinned against trading-gateway: `exchange_declined` callers in
+# proxy/ws/session.py (Kraken WS), proxy/exchanges/kraken.py (Kraken REST) and
+# proxy/exchanges/okx.py (OKX REST).
+
+
+def test_venue_error_kraken_ws_string():
+    exc = from_response(
+        "EXCHANGE_ERROR",
+        "The exchange rejected or failed the request.",
+        detail={"error": "EOrder:Unknown order", "exchange": "kraken_prime", "outcome_unknown": False},
+    )
+    assert exc.venue_error == "EOrder:Unknown order"
+    assert "EOrder:Unknown order" in str(exc)
+    # `.message` stays the Proxy's own text; only str() gains the venue's.
+    assert exc.message == "The exchange rejected or failed the request."
+
+
+def test_venue_error_kraken_rest_list_deduplicated_against_body():
+    exc = from_response(
+        "EXCHANGE_ERROR",
+        "rejected",
+        detail={
+            "kraken_http_status": 200,
+            "kraken_error": ["EOrder:Unknown order"],
+            "body": {"error": ["EOrder:Unknown order"]},
+            "exchange": "kraken_prime",
+            "outcome_unknown": False,
+        },
+    )
+    assert exc.venue_error == "EOrder:Unknown order"
+
+
+def test_venue_error_okx_smsg_then_msg():
+    per_order = from_response(
+        "EXCHANGE_ERROR",
+        "rejected",
+        detail={"okx_code": "1", "body": {"code": "1", "msg": "", "data": [{"sCode": "51008", "sMsg": "Insufficient balance"}]}},
+    )
+    assert per_order.venue_error == "Insufficient balance"
+    top = from_response(
+        "EXCHANGE_ERROR", "rejected", detail={"body": {"code": "50011", "msg": "Too Many Requests", "data": []}}
+    )
+    assert top.venue_error == "Too Many Requests"
+
+
+def test_venue_error_none_when_venue_said_nothing():
+    timeout = from_response(
+        "EXCHANGE_ERROR",
+        "The exchange did not answer in time.",
+        detail={"reason": "timeout", "exchange": "kraken_prime", "outcome_unknown": True, "message": "The exchange did not answer in time."},
+    )
+    assert timeout.venue_error is None
+    assert str(timeout) == "EXCHANGE_ERROR: The exchange did not answer in time."
+    assert from_response("EXCHANGE_ERROR", "rejected").venue_error is None
+
+
+def test_rate_limited_reads_retry_after_from_detail_when_no_header():
+    # WebSocket rejections carry no headers; proxy/ratelimit.py puts the
+    # number in detail.retry_after_seconds.
+    exc = from_response(
+        "RATE_LIMITED", "Too many requests.",
+        detail={"scope": "caller", "reason": "rate limit", "retry_after_seconds": 0.569},
+    )
+    assert isinstance(exc, RateLimitedError) and exc.retry_after == pytest.approx(0.569)
+
+
+def test_rate_limited_header_wins_over_detail():
+    exc = from_response(
+        "RATE_LIMITED", "slow", detail={"retry_after_seconds": 0.5}, retry_after=2.0
+    )
+    assert exc.retry_after == 2.0
